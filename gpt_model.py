@@ -9,7 +9,9 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from tp_linear import ColumnParallelLinear, ColumnParallelLinearQKV, RowParallelLinear
 
+from einops import rearrange
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -17,63 +19,93 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embed: int = 768
-    dropout: float = 0.0
+    dropout: float = 0.0 
+
+    # DATA_DIR=/home/t-ckarkar/heiretsu/heiretsu/data/fineweb10B bash compare_tp.sh
 
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, cfg: GPTConfig):
+class AttentionTP(nn.Module):
+    def __init__(self, cfg: GPTConfig, tp_group=None, tp_rank: int = 0, tp_world_size: int = 1):
         super().__init__()
         assert cfg.n_embed % cfg.n_head == 0
-        self.n_embed, self.n_head = cfg.n_embed, cfg.n_head
-        self.c_attn = nn.Linear(cfg.n_embed, 3 * cfg.n_embed)
-        self.c_proj = nn.Linear(cfg.n_embed, cfg.n_embed)
+        if cfg.n_embed % tp_world_size != 0:
+            raise ValueError(f"n_embed {cfg.n_embed} not divisible by tp {tp_world_size}")
+        if cfg.n_head % tp_world_size != 0:
+            raise ValueError(f"n_head {cfg.n_head} not divisible by tp {tp_world_size}")
+        self.n_embed = cfg.n_embed
+        self.n_head = cfg.n_head
+        self.tp_world_size = tp_world_size
+        self.tp_rank = tp_rank
+        self.tp_group = tp_group
+        self.nh_tp = cfg.n_head // tp_world_size
+        self.dh = cfg.n_embed // cfg.n_head
+        self.h_tp = cfg.n_embed // tp_world_size
+
+        self.c_attn = ColumnParallelLinearQKV(cfg.n_embed, cfg.n_embed, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp_world_size)
+        self.c_proj = RowParallelLinear(cfg.n_embed, cfg.n_embed, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp_world_size)
         self.c_proj.NANOGPT_SCALE_INIT = 1
         self.attn_drop = nn.Dropout(cfg.dropout)
         self.resid_drop = nn.Dropout(cfg.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, C = x.size()
-        qkv = self.c_attn(x)
-        # TP shard hint: out dim split -> (tp H_tp); einops: h -> (tp h_tp)
-        q, k, v = qkv.split(self.n_embed, dim=2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        # TP heads split: nh -> (tp nh_tp), keep dh; q/k/v: [B, nh_tp, T, dh]
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.c_proj(y)
-        # TP row-parallel hint: reduce partials; y_partial sum over tp -> y_full
+        B, S, H = x.size()
+        # qkv_shard = W_qkv(x)  # x (B,S,H) -> qkv_shard (B,S,3*H_tp)
+        qkv_shard = self.c_attn(x)
+        # qkv_shard: (B,S,3*H_tp) -> (B,S,3,H_tp) -> q,k,v each (B,S,H_tp)
+        # Then split heads: (B,S,H_tp) -> (B,nh_tp,S,dh) where nh_tp = H_tp/dh
+        # qkv_shard: (B,S,3*H_tp) -> (B,S,3,H_tp) -> q,k,v each (B,S,H_tp)
+        # q: (B,S,H_tp) -> (B,nh_tp,S,dh)
+        # k: (B,S,H_tp) -> (B,nh_tp,S,dh)
+        # v: (B,S,H_tp) -> (B,nh_tp,S,dh)
+        d_head = self.dh
+        qkv_shard = rearrange(qkv_shard,'b s (t h) -> b s t h',t=3)
+        q,k,v = qkv_shard.unbind(dim=2)
+        _,_,H_tp = q.size()
+
+        q = rearrange(q,'b s (nh_tp dh) -> b nh_tp s dh',nh_tp = H_tp//d_head, dh = d_head)
+        k = rearrange(k,'b s (nh_tp dh) -> b nh_tp s dh',nh_tp = H_tp//d_head, dh = d_head)
+        v = rearrange(v,'b s (nh_tp dh) -> b nh_tp s dh',nh_tp = H_tp//d_head, dh = d_head)
+        y = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+            is_causal=True,
+        )
+        y = rearrange (y,'b h s dh -> b s (h dh)')
+
+        # output projection (row-parallel): y_partial (B,S,H) -> all_reduce(sum,tp) -> y_full (B,S,H)
+        y = self.c_proj(y, input_is_parallel=True)
         y = self.resid_drop(y)
         return y
 
-
-class MLP(nn.Module):
-    def __init__(self, cfg: GPTConfig):
+class MLPTP(nn.Module):
+    def __init__(self, cfg: GPTConfig, tp_group=None, tp_rank: int = 0, tp_world_size: int = 1):
         super().__init__()
-        self.c_fc = nn.Linear(cfg.n_embed, 4 * cfg.n_embed)
+        self.c_fc = ColumnParallelLinear(cfg.n_embed, 4 * cfg.n_embed, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp_world_size)
         self.gelu = nn.GELU(approximate="tanh")
-        self.c_proj = nn.Linear(4 * cfg.n_embed, cfg.n_embed)
+        self.c_proj = RowParallelLinear(4 * cfg.n_embed, cfg.n_embed, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp_world_size)
         self.c_proj.NANOGPT_SCALE_INIT = 1
         self.drop = nn.Dropout(cfg.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # TP col-parallel hint: out split -> (tp I_tp); x:[B,S,H]
+        # fc1 col-parallel: x (B,S,H) -> h (B,S,I_tp)
         x = self.c_fc(x)
         x = self.gelu(x)
-        # TP row-parallel hint: in split -> (tp I_tp), reduce sum over tp to H
-        x = self.c_proj(x)
+        # fc2 row-parallel: h (B,S,I_tp) -> y_partial (B,S,H) -> all_reduce -> y (B,S,H)
+        x = self.c_proj(x, input_is_parallel=True)
         x = self.drop(x)
         return x
 
 
-class Block(nn.Module):
-    def __init__(self, cfg: GPTConfig):
+class BlockTP(nn.Module):
+    def __init__(self, cfg: GPTConfig, tp_group=None, tp_rank: int = 0, tp_world_size: int = 1):
         super().__init__()
         self.ln_1 = nn.LayerNorm(cfg.n_embed)
-        self.attn = CausalSelfAttention(cfg)
+        self.attn = AttentionTP(cfg, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp_world_size)
         self.ln_2 = nn.LayerNorm(cfg.n_embed)
-        self.mlp = MLP(cfg)
+        self.mlp = MLPTP(cfg, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp_world_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.ln_1(x))
@@ -82,14 +114,18 @@ class Block(nn.Module):
 
 
 class GPT(nn.Module):
-    def __init__(self, cfg: GPTConfig):
+    def __init__(self, cfg: GPTConfig, topo: Optional[object] = None):
         super().__init__()
         self.cfg = cfg
+        tp = getattr(topo, "tp", 1) if topo is not None else 1
+        tp_rank = getattr(topo, "tp_rank", 0) if topo is not None else 0
+        tp_group = getattr(topo, "tp_group", None) if topo is not None else None
+
         self.tr = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(cfg.vocab_size, cfg.n_embed),
                 wpe=nn.Embedding(cfg.block_size, cfg.n_embed),
-                h=nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)]),
+                h=nn.ModuleList([BlockTP(cfg, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp) for _ in range(cfg.n_layer)]),
                 ln_f=nn.LayerNorm(cfg.n_embed),
             )
         )
@@ -99,13 +135,16 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
 
     def _init_weights(self, m: nn.Module) -> None:
-        if isinstance(m, nn.Linear):
+        if isinstance(m, (nn.Linear, ColumnParallelLinear, ColumnParallelLinearQKV, RowParallelLinear)):
             std = 0.02
             if hasattr(m, "NANOGPT_SCALE_INIT"):
                 std *= (2 * self.cfg.n_layer) ** -0.5
-            nn.init.normal_(m.weight, mean=0.0, std=std)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0.0, std=std)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            else:
+                m.reset_parameters(std=std)
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
 

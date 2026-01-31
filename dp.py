@@ -21,5 +21,6 @@ def average_gradients(model: torch.nn.Module, dp_group: Optional[dist.ProcessGro
     for p in model.parameters():
         if p.grad is None:
             continue
+        # p.grad  # local shard -> all_reduce(mean, dp_group)
         dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=dp_group)
         p.grad.div_(world)  # batch dim shard: B -> (dp B_local)

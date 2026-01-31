@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DATA_DIR="${DATA_DIR:-/root/heiretsu/heiretsu/data/fineweb10B}"
+DATA_DIR="${DATA_DIR:-/home/t-ckarkar/heiretsu/heiretsu/data/fineweb10B}"
 STEPS=${STEPS:-5}
 GLOBAL_BS=${GLOBAL_BS:-64}
 BLOCK_SIZE=${BLOCK_SIZE:-512}
@@ -28,9 +28,10 @@ printf "\n=== DP run (nproc=%s, backend=%s) ===\n" "$NPROC" "$BACKEND"
 torchrun --standalone --nproc_per_node=$NPROC train.py \
   --device auto \
   --dp $NPROC --tp 1 --pp 1 \
+  --dp_share_data \
   --dist_backend $BACKEND \
   --data_dir "$DATA_DIR" \
-  --batch_size $((GLOBAL_BS / NPROC)) \
+  --batch_size $GLOBAL_BS \
   --block_size $BLOCK_SIZE \
   --max_iters $STEPS \
   --save_interval $STEPS \

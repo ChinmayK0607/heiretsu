@@ -13,6 +13,7 @@ from torch.nn import functional as F
 import torch.distributed as dist
 
 from gpt_model import GPT, GPTConfig
+from pipeline import StageModule, GPipeEngine
 from topo import init_topology, cleanup
 from dp import average_gradients
 
@@ -28,6 +29,7 @@ except Exception:
 # -------------------------
 # Binary token loaders (uint16 GPT-2 ids)
 # -------------------------
+
 def list_split_bins(data_dir: str, split: str, num_chunks: Optional[int]) -> List[str]:
     """
     Finds split files:
@@ -73,6 +75,7 @@ class BinChunkSampler:
         r = random.randrange(self.total_cap)  # [0, total_cap)
         # binary search cumulative caps
         return int(np.searchsorted(self.cum_caps, r, side="right"))
+
     def _sample_file_index_with_rng(self, rng: random.Random) -> int:
         r = rng.randrange(self.total_cap)
         return int(np.searchsorted(self.cum_caps, r, side="right"))
@@ -89,7 +92,7 @@ class BinChunkSampler:
 
 
 class RandomBatchLoader:
-    def __init__(self, data_dir, split, B, T, num_chunks, seed=1337, rank=0, dp_rank=0, dp_size=1):
+    def __init__(self, data_dir, split, B, T, num_chunks, seed=1337, rank=0, dp_rank=0, dp_size=1, log_rank=None):
         # Partition files across DP ranks to avoid overlap: files[dp_rank :: dp_size]
         files_all = list_split_bins(data_dir, split, num_chunks)
         files = files_all[dp_rank::dp_size] if dp_size > 1 else files_all
@@ -97,14 +100,14 @@ class RandomBatchLoader:
             raise FileNotFoundError(f"No {split} files assigned to dp_rank={dp_rank} out of {len(files_all)} total.")
         self.sampler = BinChunkSampler(files, T)
         self.B, self.T = B, T
-        self.rng = random.Random(seed + rank)   # rank-sharded RNG
-        if rank == 0:
+        self.rng = random.Random(seed + rank)   # data-rank-sharded RNG
+        log_rank = rank if log_rank is None else log_rank
+        if log_rank == 0:
             print(f"[{split}] dp_shard={dp_rank}/{dp_size} files={len(files)} tokens={sum(self.sampler.lengths):,} T={T}")
 
     def next_batch(self, device):
         xs, ys = [], []
         for _ in range(self.B):
-            # use self.rng instead of global random
             fi = self.sampler._sample_file_index_with_rng(self.rng)
             L  = self.sampler.lengths[fi]
             start = self.rng.randint(0, L - (self.T + 1))
@@ -134,10 +137,36 @@ def estimate_loss(model, loader, eval_iters, device, amp_mode: str) -> float:
     return sum(losses) / len(losses)
 
 
+@torch.no_grad()
+def estimate_loss_pipeline(engine: GPipeEngine, loader, eval_iters, device, amp_mode: str, micro_batches: int, dp_group) -> Optional[float]:
+    engine.stage.eval()
+    losses = []
+    use_amp = amp_mode in ("fp16", "bf16") and device.type in ("cuda", "mps")
+    dtype = torch.float16 if amp_mode == "fp16" else torch.bfloat16
+    for _ in range(eval_iters):
+        loss = engine.forward_only(
+            loader,
+            micro_batches=micro_batches,
+            device=device,
+            use_amp=use_amp,
+            amp_dtype=dtype,
+            batch_size=loader.B,
+        )
+        if loss is not None and dp_group is not None and dist.is_initialized():
+            dist.all_reduce(loss, op=dist.ReduceOp.SUM, group=dp_group)
+            loss = loss / dist.get_world_size(group=dp_group)
+        if loss is not None:
+            losses.append(float(loss.item()))
+    engine.stage.train()
+    if losses:
+        return sum(losses) / len(losses)
+    return None
+
 
 # -------------------------
 # Main
 # -------------------------
+
 def main():
     p = argparse.ArgumentParser(description="GPT trainer on FineWeb10B .bin tokens (AMP + grad accumulation + wandb)")
 
@@ -153,7 +182,7 @@ def main():
     # model
     p.add_argument("--n_layer", type=int, default=6)
     p.add_argument("--n_head", type=int, default=6)
-    p.add_argument("--n_embed", type=int, default=786)
+    p.add_argument("--n_embed", type=int, default=768)
     p.add_argument("--dropout", type=float, default=0.2)
 
     # optimization
@@ -171,10 +200,11 @@ def main():
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
     p.add_argument("--seed", type=int, default=1337)
 
-    # parallelism topo (v1: DP only, placeholders for TP/PP)
+    # parallelism topo (DP/TP/PP)
     p.add_argument("--dp", type=int, default=1, help="Data parallel degree")
     p.add_argument("--tp", type=int, default=1, help="Tensor parallel degree")
     p.add_argument("--pp", type=int, default=1, help="Pipeline parallel degree")
+    p.add_argument("--dp_share_data", action="store_true", help="Force all DP ranks to read identical data (parity/debug)")
     p.add_argument("--dist_backend", type=str, default="nccl", choices=["nccl", "gloo"], help="torch.distributed backend")
 
     # wandb
@@ -221,13 +251,12 @@ def main():
     rank = topo.rank
     world_size = topo.world_size
 
-
     # model init must be identical across DP ranks -> seed with base seed only
     torch.manual_seed(args.seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
 
-    # model + optimizer
+    # model / stage init
     cfg = GPTConfig(
         block_size=args.block_size,
         n_layer=args.n_layer,
@@ -235,31 +264,46 @@ def main():
         n_embed=args.n_embed,
         dropout=args.dropout,
     )
-    model = GPT(cfg).to(device)
+    use_pipeline = topo.pp > 1
+    if use_pipeline:
+        stage = StageModule(cfg, topo, topo.pp_rank, topo.pp).to(device)
+        engine = GPipeEngine(stage, topo)
+        local_module = stage
+    else:
+        model = GPT(cfg, topo=topo).to(device)
+        engine = None
+        local_module = model
 
-    # per-rank RNG for data/order; weights already synced via base seed
-    global_seed = args.seed + rank
-    random.seed(global_seed)
-    np.random.seed(global_seed)
-    torch.manual_seed(global_seed)
+    # per-rank RNG:
+    # - data RNG keyed by dp_rank so all PP/TP ranks within a DP replica share batches
+    # - torch RNG keyed by (dp_rank, pp_rank) so TP ranks stay in sync for dropout
+    # For parity/debug, optionally make all DP ranks consume identical data by sharing seed + file shard
+    data_seed = args.seed if args.dp_share_data else args.seed + topo.dp_rank
+    random.seed(data_seed)
+    np.random.seed(data_seed)
+    torch_seed = args.seed if args.dp_share_data else args.seed + topo.dp_rank * 1000 + topo.pp_rank
+    torch.manual_seed(torch_seed)
     if device.type == "cuda":
-        torch.cuda.manual_seed_all(global_seed)
+        torch.cuda.manual_seed_all(torch_seed)
 
-    # loaders (rank-sharded RNG)
+    # loaders (dp-rank sharded RNG)
+    dp_rank_for_data = 0 if args.dp_share_data else topo.dp_rank
+    dp_size_for_data = 1 if args.dp_share_data else topo.dp
+    rank_for_data = 0 if args.dp_share_data else topo.dp_rank
     train_loader = RandomBatchLoader(
         args.data_dir, "train", args.batch_size, args.block_size,
-        args.num_train_chunks, seed=args.seed, rank=rank,
-        dp_rank=topo.dp_rank, dp_size=topo.dp
+        args.num_train_chunks, seed=args.seed, rank=rank_for_data,
+        dp_rank=dp_rank_for_data, dp_size=dp_size_for_data, log_rank=rank
     )
-    # keep val shared across ranks for now (optionally shard later)
-    val_loader   = RandomBatchLoader(
+    # keep val shared across ranks for now
+    val_loader = RandomBatchLoader(
         args.data_dir, "val", args.batch_size, args.block_size,
-        args.num_val_chunks, seed=args.seed+999, rank=rank,
-        dp_rank=0, dp_size=1
+        args.num_val_chunks, seed=args.seed + 999, rank=0,
+        dp_rank=0, dp_size=1, log_rank=rank
     )
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        local_module.parameters(),
         lr=args.learning_rate,
         betas=tuple(args.betas),
         weight_decay=args.weight_decay,
@@ -268,8 +312,8 @@ def main():
     # AMP
     use_amp = args.amp in ("fp16", "bf16") and device.type in ("cuda", "mps")
     amp_dtype = torch.float16 if args.amp == "fp16" else torch.bfloat16
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.amp == "fp16" and device.type == "cuda"))
-    is_main = (rank == 0)
+    scaler = torch.amp.GradScaler('cuda',enabled=(args.amp == "fp16"))
+    is_main = (topo.dp_rank == 0 and topo.tp_rank == 0 and topo.pp_rank == (topo.pp - 1))
 
     def log_wandb(payload, step=None):
         if is_main and run is not None:
@@ -292,7 +336,7 @@ def main():
         print("wandb not available; proceeding without external logging.")
 
     # training
-    model.train()
+    local_module.train()
     t0 = time.time()
     tokens_per_micro = args.batch_size * args.block_size
     micro_in_macro = args.grad_accum_steps
@@ -300,31 +344,44 @@ def main():
     last_log_time = time.time()
 
     for step in range(1, args.max_iters + 1):
-        # accumulate
-        for micro in range(1, micro_in_macro + 1):
-            x, y = train_loader.next_batch(device)
-            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                _, loss = model(x, y)
-                loss = loss / micro_in_macro
+        if use_pipeline:
+            loss_scalar = engine.forward_backward(
+                train_loader,
+                micro_batches=micro_in_macro,
+                device=device,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+                scaler=scaler,
+                batch_size=args.batch_size,
+            )
+        else:
+            # accumulate on a single stage (DP/TP only)
+            for _ in range(1, micro_in_macro + 1):
+                x, y = train_loader.next_batch(device)
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                    _, loss = local_module(x, y)
+                    loss = loss / micro_in_macro
 
-            if scaler.is_enabled():
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
+                if scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+            loss_scalar = loss.detach().float()
 
-        # log the last micro loss
-        loss_scalar = loss.detach().float()
+        if loss_scalar is not None and topo.dp_group is not None and dist.is_initialized():
+            dist.all_reduce(loss_scalar, op=dist.ReduceOp.SUM, group=topo.dp_group)
+            loss_scalar = loss_scalar / dist.get_world_size(group=topo.dp_group)
 
         # unscale first when using AMP
         if scaler.is_enabled():
             scaler.unscale_(optimizer)
 
-        # DP grad sync: batch shard B -> (dp B_local)
-        average_gradients(model, topo.dp_group)
+        # DP grad sync: p.grad -> all_reduce(mean, dp_group)
+        average_gradients(local_module, topo.dp_group)
 
         # clip
         if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            torch.nn.utils.clip_grad_norm_(local_module.parameters(), args.grad_clip)
 
         # step
         if scaler.is_enabled():
@@ -333,18 +390,21 @@ def main():
             optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
-        # throughput (rank-0 prints)
+        # throughput (log rank prints)
         now = time.time()
         dt = now - last_log_time
         eff_toks_per_sec = (tokens_per_micro * micro_in_macro) / dt if dt > 0 else float("inf")
         last_log_time = now
 
         if is_main and ((step % max(1, args.eval_interval // 10)) == 0 or step == 1):
-            print(f"step {step:6d} | train_loss (global last micro) {loss_scalar.item():.4f} | eff_tok/s {eff_toks_per_sec:,.0f}")
+            if loss_scalar is not None:
+                print(f"step {step:6d} | train_loss (mean micro) {loss_scalar.item():.4f} | eff_tok/s {eff_toks_per_sec:,.0f}")
+            else:
+                print(f"step {step:6d} | train_loss (mean micro) n/a | eff_tok/s {eff_toks_per_sec:,.0f}")
 
         if is_main and run:
             wandb.log({
-                "train/loss_last_micro_global": float(loss_scalar.item()),
+                "train/loss_mean_micro": float(loss_scalar.item()) if loss_scalar is not None else float("nan"),
                 "opt/lr": float(optimizer.param_groups[0]["lr"]),
                 "speed/eff_tokens_per_sec": eff_toks_per_sec,
                 "amp/enabled": int(use_amp),
@@ -355,17 +415,27 @@ def main():
 
         # periodic eval
         if (step % args.eval_interval) == 0 or step == args.max_iters:
-            eval_loss = estimate_loss(model, val_loader, args.eval_iters, device, args.amp)
-            if is_main:
+            if use_pipeline:
+                eval_loss = estimate_loss_pipeline(engine, val_loader, args.eval_iters, device, args.amp, micro_in_macro, topo.dp_group)
+            else:
+                eval_loss = estimate_loss(local_module, val_loader, args.eval_iters, device, args.amp)
+            if is_main and eval_loss is not None:
                 print(f"[eval] step {step} | eval_loss {eval_loss:.4f} | elapsed {time.time()-t0:.1f}s")
                 if run:
                     wandb.log({"eval/loss": eval_loss, "step": step}, step=step)
 
+        # checkpointing
+        if args.save_interval and (step % args.save_interval == 0) and (topo.dp_rank == 0):
+            if topo.tp == 1 and topo.pp == 1 and is_main:
+                torch.save({"model": local_module.state_dict(), "cfg": asdict(cfg), "step": step}, f"ckpt_{step:07d}.pt")
+            else:
+                torch.save({
+                    "model": local_module.state_dict(),
+                    "cfg": asdict(cfg),
+                    "step": step,
+                    "topo": {"dp": topo.dp, "tp": topo.tp, "pp": topo.pp, "pp_rank": topo.pp_rank, "tp_rank": topo.tp_rank},
+                }, f"ckpt_{step:07d}_pp{topo.pp_rank}_tp{topo.tp_rank}.pt")
 
-
-        if args.save_interval and (step % args.save_interval == 0) and is_main:
-            torch.save({"model": model.state_dict(), "cfg": asdict(cfg), "step": step},
-                f"ckpt_{step:07d}.pt")
     if is_main and run:
         run.finish()
         print("training finished.")

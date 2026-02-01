@@ -74,8 +74,8 @@ class StageModule(nn.Module):
         self.apply(self._init_weights)
 
     def _init_weights(self, m: nn.Module) -> None:
-        from tp_linear import ColumnParallelLinear, RowParallelLinear
-        if isinstance(m, (nn.Linear, ColumnParallelLinear, RowParallelLinear)):
+        from tp_linear import ColumnParallelLinear, ColumnParallelLinearQKV, RowParallelLinear
+        if isinstance(m, (nn.Linear, ColumnParallelLinear, ColumnParallelLinearQKV, RowParallelLinear)):
             std = 0.02
             if hasattr(m, "NANOGPT_SCALE_INIT"):
                 std *= (2 * self.cfg.n_layer) ** -0.5

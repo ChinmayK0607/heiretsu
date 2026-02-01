@@ -13,6 +13,56 @@ import torch.nn as nn
 import torch.distributed as dist
 import einops
 
+
+# ========== Autograd-aware collective operations ==========
+
+class _CopyToModelParallelRegion(torch.autograd.Function):
+    """Identity in forward, all-reduce in backward.
+    
+    Used before ColumnParallelLinear to ensure gradients from all TP ranks
+    are summed when flowing back through the input.
+    """
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, tp_group: Optional[dist.ProcessGroup]) -> torch.Tensor:
+        ctx.tp_group = tp_group
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        if ctx.tp_group is not None and dist.is_initialized():
+            dist.all_reduce(grad_output, op=dist.ReduceOp.SUM, group=ctx.tp_group)
+        return grad_output, None
+
+
+class _ReduceFromModelParallelRegion(torch.autograd.Function):
+    """All-reduce in forward, identity in backward.
+    
+    Used after RowParallelLinear's local matmul to sum partial results.
+    In backward, the gradient flows unchanged (no collective needed).
+    """
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, tp_group: Optional[dist.ProcessGroup]) -> torch.Tensor:
+        if tp_group is not None and dist.is_initialized():
+            dist.all_reduce(x, op=dist.ReduceOp.SUM, group=tp_group)
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        return grad_output, None
+
+
+def copy_to_model_parallel_region(x: torch.Tensor, tp_group: Optional[dist.ProcessGroup]) -> torch.Tensor:
+    """Wrapper for _CopyToModelParallelRegion."""
+    return _CopyToModelParallelRegion.apply(x, tp_group)
+
+
+def reduce_from_model_parallel_region(x: torch.Tensor, tp_group: Optional[dist.ProcessGroup]) -> torch.Tensor:
+    """Wrapper for _ReduceFromModelParallelRegion."""
+    return _ReduceFromModelParallelRegion.apply(x, tp_group)
+
+
+# ========== Helper functions ==========
+
 def _tp_world_size(tp_group: Optional[dist.ProcessGroup]) -> int:
     if tp_group is None or not dist.is_initialized():
         return 1
@@ -83,26 +133,26 @@ class ColumnParallelLinear(nn.Module):
                 self.bias.copy_(b_shard)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # TODO: implement column-parallel forward with einops-style reshape
+        # Column-parallel forward: input is replicated, output is sharded.
+        # In backward, we need to all-reduce the input gradient.
+        # Use copy_to_model_parallel_region for autograd-aware all-reduce in backward.
+        x = copy_to_model_parallel_region(x, self.tp_group)
+        
         # x: (B,S,in_features)
-        # W_full: (out_features, in_features)
-        # W_shard = self.weight: (out_features/TP, in_features)  # already sharded along out_features
-        # b_shard (optional): (out_features/TP)
-        # 1) flatten: x (B,S,in) -> x2d (B*S, in)
-        B,S,in_features = x.shape
+        # W_shard = self.weight: (out_features/TP, in_features)
+        B, S, in_features = x.shape
         x2d = einops.rearrange(x, 'b s in -> (b s) in')
         W_shard = self.weight
         b_shard = self.bias
-        # 2) local matmul: y_shard_2d = x2d @ W_shard.T  # (B*S, out/TP)
+        # local matmul: y_shard_2d = x2d @ W_shard.T  # (B*S, out/TP)
         y_shard_2d = einops.einsum(x2d, W_shard, 'bs in, op in -> bs op')
-        # 3) add bias shard: y_shard_2d + b_shard  # (B*S, out/TP)
+        # add bias shard
         if b_shard is not None: 
-            y_shard_2d += b_shard
-        # 4) unflatten: y_shard_2d (B*S, out/TP) -> y_shard (B,S,out/TP)
-        y_shard = einops.rearrange(y_shard_2d,'(b s) op -> b s op', b = B, s=S)
-        # Expected output: y_shard (B,S,out_features/TP)
+            y_shard_2d = y_shard_2d + b_shard
+        # unflatten: y_shard_2d (B*S, out/TP) -> y_shard (B,S,out/TP)
+        y_shard = einops.rearrange(y_shard_2d, '(b s) op -> b s op', b=B, s=S)
+        # Output: y_shard (B,S,out_features/TP)
         return y_shard
-        # raise NotImplementedError("Implement ColumnParallelLinear.forward with einops-style reshape.")
 
 
 class ColumnParallelLinearQKV(nn.Module):
@@ -164,7 +214,10 @@ class ColumnParallelLinearQKV(nn.Module):
                 self.bias.copy_(b_shard)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Same as ColumnParallelLinear forward, but weight/bias already packed as QKV shards.
+        # Column-parallel QKV forward: input is replicated, output is sharded.
+        # Use copy_to_model_parallel_region for autograd-aware all-reduce in backward.
+        x = copy_to_model_parallel_region(x, self.tp_group)
+        
         # x: (B,S,in_features) -> y_shard (B,S,3*out_features/TP)
         B, S, _ = x.shape
         x2d = einops.rearrange(x, "b s in -> (b s) in")
@@ -223,14 +276,13 @@ class RowParallelLinear(nn.Module):
                 self.bias.copy_(full_b.to(self.bias.device))
 
     def forward(self, x: torch.Tensor, input_is_parallel: Optional[bool] = None) -> torch.Tensor:
-        # TODO: implement row-parallel forward with einops-style reshape
+        # Row-parallel forward: input is sharded, output is replicated (all-reduced).
         # x_full: (B,S,in_features) or x_shard: (B,S,in_features/TP)
-        # W_full: (out_features, in_features)
-        # W_shard: (out_features, in_features/TP)  # slice along in_features
+        # W_shard: (out_features, in_features/TP)
         # b_full (optional, replicated): (out_features)
-        # 1) detect if input is already sharded (in/TP)
+        
+        # Detect if input is already sharded
         if input_is_parallel is None:
-            # Auto-detect: if last dim == in_per_partition, assume sharded
             input_is_parallel = (x.size(-1) == self.in_per_partition)
         
         if input_is_parallel:
@@ -239,24 +291,22 @@ class RowParallelLinear(nn.Module):
             # Split full input along last dim and take this rank's shard
             x_shards = _split_last_dim(x, self.tp_world_size)  # (tp, B, S, in/TP)
             x_shard = x_shards[self.tp_rank]  # (B, S, in/TP)
-        B,S,_ = x_shard.shape
-        W_shard = self.weight
-        # 2) if full, split last dim: x_full (B,S,in) -> x_shards (tp,B,S,in/TP) -> x_shard for this tp_rank
-        # 3) flatten: x_shard (B,S,in/TP) -> x2d (B*S, in/TP)
-        x_2d = einops.rearrange(x_shard,'b s in -> (b s) in')
-        # 4) local matmul: y_partial_2d = x2d @ W_shard.T  # (B*S, out)
-        y_partial_2d = einops.einsum(x_2d, W_shard , 'bs in, op in -> bs op')
-        # 5) unflatten: y_partial_2d (B*S, out) -> y_partial (B,S,out)
-        y_partial = einops.rearrange(y_partial_2d,'(b s) op -> b s op', b = B , s = S)
-        # 6) all_reduce(sum,tp): y_partial -> y_full (B,S,out)
-        if self.tp_group is not None and dist.is_initialized():
-            dist.all_reduce(y_partial, op=dist.ReduceOp.SUM, group=self.tp_group)
-        y_full = y_partial
         
-        # 7) add bias (replicated): y_full + b_full
+        B, S, _ = x_shard.shape
+        W_shard = self.weight
+        
+        # flatten: x_shard (B,S,in/TP) -> x2d (B*S, in/TP)
+        x_2d = einops.rearrange(x_shard, 'b s in -> (b s) in')
+        # local matmul: y_partial_2d = x2d @ W_shard.T  # (B*S, out)
+        y_partial_2d = einops.einsum(x_2d, W_shard, 'bs in, op in -> bs op')
+        # unflatten: y_partial_2d (B*S, out) -> y_partial (B,S,out)
+        y_partial = einops.rearrange(y_partial_2d, '(b s) op -> b s op', b=B, s=S)
+        
+        # Use autograd-aware all-reduce: forward does sum, backward is identity
+        y_full = reduce_from_model_parallel_region(y_partial, self.tp_group)
+        
+        # add bias (replicated)
         if self.bias is not None:
             y_full = y_full + self.bias
         
-        # Expected output: y_full (B,S,out_features)
         return y_full
-        # raise NotImplementedError("Implement RowParallelLinear.forward with einops-style reshape.")

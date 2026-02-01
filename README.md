@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 wip
 =======
 Minimal 3D parallelism (DP + TP + PP) in pure PyTorch.
@@ -105,4 +105,3 @@ PASS (6):
   dp=1 tp=2 pp=2 (diff=1.19e-07)
 FAIL (0):
 ```
->>>>>>> 9bfa395 (Refine TP pipeline and add test coverage)

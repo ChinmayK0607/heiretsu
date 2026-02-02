@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Change to the heiretsu project root (parent of tests/)
+cd "$(dirname "$0")/.."
 BACKEND=${BACKEND:-nccl}
 THRESH=${THRESH:-1e-4}
 TRAIN_STEPS=${TRAIN_STEPS:-10}

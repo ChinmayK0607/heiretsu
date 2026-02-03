@@ -7,77 +7,115 @@ BACKEND=${BACKEND:-nccl}
 THRESH=${THRESH:-1e-4}
 TRAIN_STEPS=${TRAIN_STEPS:-10}
 MICRO_BATCHES=${MICRO_BATCHES:-8}
+NUM_EXPERTS=${NUM_EXPERTS:-8}
+TOP_K=${TOP_K:-2}
 LOG_DIR=${LOG_DIR:-tests/logs/full_suite_$(date +%Y%m%d_%H%M%S)}
+TEST_MOE=${TEST_MOE:-auto}  # auto, 0, or 1
 
 mkdir -p "$LOG_DIR"
 
-# Base configs for 4 GPUs
-configs=(
-  "dp=4,tp=1,pp=1"
-  "dp=1,tp=4,pp=1"
-  "dp=1,tp=1,pp=4"
-  "dp=2,tp=2,pp=1"
-  "dp=2,tp=1,pp=2"
-  "dp=1,tp=2,pp=2"
-)
-
-# Add full 3D config if 8+ GPUs available
+# Detect GPU count
 if command -v nvidia-smi &> /dev/null; then
   num_gpus=$(nvidia-smi --list-gpus | wc -l)
-  if [[ $num_gpus -ge 8 ]]; then
-    configs+=("dp=2,tp=2,pp=2")
+else
+  num_gpus=0
+fi
+
+echo "Detected $num_gpus GPUs"
+
+# Configs: "dp,ep,tp,pp,moe" where moe=0 (dense) or 1 (MoE)
+configs=()
+
+# 4-GPU dense configs
+if [[ $num_gpus -ge 4 ]]; then
+  configs+=(
+    "4,1,1,1,0"   # DP only
+    "1,1,4,1,0"   # TP only
+    "1,1,1,4,0"   # PP only
+    "2,1,2,1,0"   # DP + TP
+    "2,1,1,2,0"   # DP + PP
+    "1,1,2,2,0"   # TP + PP
+  )
+fi
+
+# 8-GPU configs
+if [[ $num_gpus -ge 8 ]]; then
+  # Dense 3D
+  configs+=(
+    "2,1,2,2,0"   # Full 3D (DP + TP + PP)
+    "4,1,2,1,0"   # DP(4) + TP(2)
+    "2,1,4,1,0"   # DP(2) + TP(4)
+  )
+  
+  # MoE + EP configs (if enabled)
+  if [[ "$TEST_MOE" == "auto" || "$TEST_MOE" == "1" ]]; then
+    configs+=(
+      "2,2,2,1,1"   # DP(2) + EP(2) + TP(2) - 4D MoE
+      "4,2,1,1,1"   # DP(4) + EP(2) - MoE with EP
+      "1,2,2,2,1"   # EP(2) + TP(2) + PP(2) - MoE 3D
+      "2,4,1,1,1"   # DP(2) + EP(4) - heavy EP
+    )
   fi
 fi
 
-printf "\n=== FULL SUITE: forward+backward+grad parity+training sanity ===\n"
+printf "\n=== FULL SUITE: 4D Parallelism (DP+EP+TP+PP) + MoE ===\n"
+printf "GPUs: %d  Thresh: %s  MoE Experts: %d  Top-K: %d\n" "$num_gpus" "$THRESH" "$NUM_EXPERTS" "$TOP_K"
 
 pass=()
 fail=()
 
 for cfg in "${configs[@]}"; do
-  IFS=',' read -r dp_kv tp_kv pp_kv <<< "$cfg"
-  dp=${dp_kv#dp=}
-  tp=${tp_kv#tp=}
-  pp=${pp_kv#pp=}
-  nproc=$((dp*tp*pp))
-  logfile="$LOG_DIR/dp${dp}_tp${tp}_pp${pp}.log"
+  IFS=',' read -r dp ep tp pp moe <<< "$cfg"
+  nproc=$((dp*ep*tp*pp))
+  
+  # Skip if not enough GPUs
+  if [[ $nproc -gt $num_gpus ]]; then
+    echo "[SKIP] dp=$dp ep=$ep tp=$tp pp=$pp moe=$moe (needs $nproc GPUs)"
+    continue
+  fi
+  
+  tag="dp=${dp}_ep=${ep}_tp=${tp}_pp=${pp}"
+  [[ $moe -eq 1 ]] && tag="${tag}_moe"
+  logfile="$LOG_DIR/${tag}.log"
+  
+  moe_args=""
+  if [[ $moe -eq 1 ]]; then
+    moe_args="--num_experts $NUM_EXPERTS --top_k $TOP_K"
+  fi
 
-  printf "\n--- cfg: dp=%s tp=%s pp=%s (nproc=%s) --- [%s]\n" "$dp" "$tp" "$pp" "$nproc" "$(date +%H:%M:%S)" | tee -a "$logfile"
+  printf "\n--- cfg: dp=%s ep=%s tp=%s pp=%s moe=%s (nproc=%s) --- [%s]\n" \
+    "$dp" "$ep" "$tp" "$pp" "$moe" "$nproc" "$(date +%H:%M:%S)" | tee -a "$logfile"
 
   # Forward + backward sanity (logit diff + backward OK)
   echo "[parallel_sanity] start $(date +%H:%M:%S)" | tee -a "$logfile"
-  out=$(PYTHONPATH="$(pwd)" torchrun --standalone --nproc_per_node=$nproc tests/parallel_sanity.py \
-    --dp $dp --tp $tp --pp $pp --backend $BACKEND 2>&1 | tee -a "$logfile" /dev/stderr)
+  out=$(torchrun --standalone --nproc_per_node=$nproc tests/parallel_sanity.py \
+    --dp $dp --ep $ep --tp $tp --pp $pp --backend $BACKEND $moe_args 2>&1 | tee -a "$logfile" /dev/stderr)
 
-  diff_max=$(echo "$out" | grep -m1 "LOGIT_DIFF_MAX" | cut -d'=' -f2)
-  bwd_ok=$(echo "$out" | grep -m1 "BACKWARD_OK" | cut -d'=' -f2)
+  diff_max=$(echo "$out" | grep -m1 "LOGIT_DIFF_MAX" | cut -d'=' -f2 || echo "")
+  bwd_ok=$(echo "$out" | grep -m1 "BACKWARD_OK" | cut -d'=' -f2 || echo "")
 
   # Grad parity (prints diffs; no strict threshold here)
   echo "[grad_parity] start $(date +%H:%M:%S)" | tee -a "$logfile"
-  PYTHONPATH="$(pwd)" torchrun --standalone --nproc_per_node=$nproc tests/grad_parity.py \
-    --dp $dp --tp $tp --pp $pp --backend $BACKEND | tee -a "$logfile"
+  torchrun --standalone --nproc_per_node=$nproc tests/grad_parity.py \
+    --dp $dp --ep $ep --tp $tp --pp $pp --backend $BACKEND $moe_args 2>&1 | tee -a "$logfile"
 
   # Training sanity (boundary push)
   echo "[boundary_push] start $(date +%H:%M:%S)" | tee -a "$logfile"
-  PYTHONPATH="$(pwd)" torchrun --standalone --nproc_per_node=$nproc tests/boundary_push.py \
-    --dp $dp --tp $tp --pp $pp --steps $TRAIN_STEPS --micro_batches $MICRO_BATCHES --backend $BACKEND | tee -a "$logfile"
+  torchrun --standalone --nproc_per_node=$nproc tests/boundary_push.py \
+    --dp $dp --ep $ep --tp $tp --pp $pp --steps $TRAIN_STEPS --micro_batches $MICRO_BATCHES \
+    --backend $BACKEND $moe_args 2>&1 | tee -a "$logfile"
 
   if [[ -z "$diff_max" || -z "$bwd_ok" ]]; then
-    fail+=("dp=$dp tp=$tp pp=$pp (missing output)")
+    fail+=("$tag (missing output)")
     continue
   fi
 
-  cmp=$(python - <<PY
-import math
-val=float("$diff_max")
-print(1 if val <= float("$THRESH") else 0)
-PY
-)
+  cmp=$(python3 -c "print(1 if float('$diff_max') <= float('$THRESH') else 0)" 2>/dev/null || echo "0")
 
   if [[ "$cmp" == "1" && "$bwd_ok" == "1" ]]; then
-    pass+=("dp=$dp tp=$tp pp=$pp (diff=$diff_max)")
+    pass+=("$tag (diff=$diff_max)")
   else
-    fail+=("dp=$dp tp=$tp pp=$pp (diff=$diff_max, bwd=$bwd_ok)")
+    fail+=("$tag (diff=$diff_max, bwd=$bwd_ok)")
   fi
 
 done
@@ -88,3 +126,8 @@ for p in "${pass[@]}"; do echo "  $p"; done
 printf "FAIL (%d):\n" "${#fail[@]}"
 for f in "${fail[@]}"; do echo "  $f"; done
 printf "\nLogs saved to: %s\n" "$LOG_DIR"
+
+# Exit with error if any failures
+if [[ ${#fail[@]} -gt 0 ]]; then
+  exit 1
+fi

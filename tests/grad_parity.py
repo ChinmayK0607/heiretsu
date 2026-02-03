@@ -6,8 +6,13 @@ Checks gradients for a small subset of parameters across DP/TP/PP.
 from __future__ import annotations
 
 import argparse
+import os
 import random
+import sys
 from typing import Dict, Any, List
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import torch
@@ -242,7 +247,7 @@ def main() -> None:
         setup_seed(args.seed, device)
         base = GPT(cfg).to(device)
         base.train()
-        _, base_loss = base(x, y)
+        _, base_loss, _ = base(x, y)
         base_loss.backward()
         base_state = base.state_dict()
         base_grads = _gather_param_grads(

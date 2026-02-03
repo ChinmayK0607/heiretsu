@@ -186,73 +186,164 @@ if moe_accum and is_main and run:
 
 ---
 
-## Part 3: Checkpoint Saving to Modal Volume
+## Part 3: PyTorch Profiler Traces
+
+Save traces to **both** ddp-traces volume (for Perfetto) AND WandB artifacts.
+
+**File:** [train.py](train.py)
+
+### 3a. Add profiler arguments
+
+```python
+p.add_argument("--profile", action="store_true", help="Enable PyTorch profiler")
+p.add_argument("--profile_steps", type=int, default=10, help="Steps to profile")
+p.add_argument("--profile_warmup", type=int, default=3, help="Warmup steps")
+p.add_argument("--trace_dir", type=str, default=".", help="Directory for traces")
+```
+
+### 3b. Add trace handler (saves to file AND WandB)
+
+```python
+from torch.profiler import profile, ProfilerActivity, schedule
+
+def make_trace_handler(trace_dir, run):
+    """Returns handler that saves trace to file AND uploads to WandB."""
+    def handler(prof):
+        trace_path = f"{trace_dir}/trace_step_{prof.step_num}.json"
+        prof.export_chrome_trace(trace_path)
+        print(f"Saved trace to {trace_path}")
+        
+        # Upload to WandB as artifact
+        if run:
+            artifact = wandb.Artifact(f"trace-step-{prof.step_num}", type="trace")
+            artifact.add_file(trace_path)
+            run.log_artifact(artifact)
+            print(f"Uploaded trace to WandB artifacts")
+    return handler
+```
+
+### 3c. Profiler in training loop
+
+```python
+# Setup profiler (only on rank 0)
+if args.profile and is_main:
+    prof = profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=schedule(wait=1, warmup=args.profile_warmup, active=args.profile_steps, repeat=1),
+        on_trace_ready=make_trace_handler(args.trace_dir, run),
+        record_shapes=True,
+        with_stack=True,
+    )
+    prof.start()
+else:
+    prof = None
+
+# In training loop:
+if prof:
+    prof.step()
+    if step == args.profile_warmup + args.profile_steps + 1:
+        prof.stop()
+        prof = None
+```
+
+---
+
+## Part 4: Checkpoints to HuggingFace Hub
+
+Save checkpoints to `TheFireHacker/moe-first-try` on HuggingFace.
+
+**File:** [train.py](train.py)
+
+### 4a. Add HuggingFace arguments
+
+```python
+p.add_argument("--hf_repo", type=str, default=None, help="HuggingFace repo (e.g., TheFireHacker/moe-first-try)")
+p.add_argument("--save_interval", type=int, default=0, help="Save every N steps (0=disable)")
+```
+
+### 4b. Add upload function
+
+```python
+def upload_checkpoint_hf(state_dict, cfg, step, repo_id):
+    """Upload checkpoint to HuggingFace Hub."""
+    import tempfile
+    from huggingface_hub import HfApi
+    
+    token = os.environ.get("HF_TOKEN")
+    api = HfApi(token=token)
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt_path = f"{tmpdir}/checkpoint_step_{step:07d}.pt"
+        torch.save({"model": state_dict, "cfg": cfg, "step": step}, ckpt_path)
+        
+        api.upload_file(
+            path_or_fileobj=ckpt_path,
+            path_in_repo=f"checkpoints/checkpoint_step_{step:07d}.pt",
+            repo_id=repo_id,
+            commit_message=f"Checkpoint at step {step}",
+        )
+        print(f"Uploaded checkpoint to {repo_id}/checkpoints/")
+```
+
+### 4c. Call in training loop
+
+```python
+if args.save_interval and args.hf_repo and (step % args.save_interval == 0) and is_main:
+    upload_checkpoint_hf(local_module.state_dict(), asdict(cfg), step, args.hf_repo)
+```
+
+---
+
+## Part 5: Modal Configuration
 
 **File:** [modal_train.py](modal_train.py)
 
-### 3a. Mount ddp-traces volume
+### 5a. Add secrets and volumes
 
 ```python
 fineweb_volume = modal.Volume.from_name("fineweb-data")
-traces_volume = modal.Volume.from_name("ddp-traces")  # NEW
+traces_volume = modal.Volume.from_name("ddp-traces")
 wandb_secret = modal.Secret.from_name("wandb-secret")
+hf_secret = modal.Secret.from_name("hf-secret")  # Contains HF_TOKEN
 
 @app.function(
     image=image,
     gpu="a100-40gb:4",
     timeout=3600,
-    secrets=[wandb_secret],
+    secrets=[wandb_secret, hf_secret],
     volumes={
         "/data": fineweb_volume,
-        "/traces": traces_volume,  # NEW
+        "/traces": traces_volume,
     },
 )
 def train():
-    # ...
-```
-
-### 3b. Add checkpoint args to command
-
-```python
-cmd = [
-    # ... existing args ...
-    "--save_interval=500",  # Save every 500 steps
-    "--save_dir=/traces",   # Save to mounted volume
-]
-```
-
-**File:** [train.py](train.py)
-
-### 3c. Add save_dir argument and use it
-
-```python
-p.add_argument("--save_dir", type=str, default=".", help="Directory for checkpoints")
-
-# In checkpoint saving:
-if args.save_interval and (step % args.save_interval == 0):
-    ckpt_path = os.path.join(args.save_dir, f"ckpt_{step:07d}.pt")
-    torch.save({...}, ckpt_path)
-    print(f"Saved checkpoint to {ckpt_path}")
+    # Add to cmd:
+    cmd.extend([
+        "--profile",
+        "--trace_dir=/traces",
+        "--hf_repo=TheFireHacker/moe-first-try",
+        "--save_interval=500",
+    ])
+    # After subprocess.run:
+    traces_volume.commit()  # Persist traces to volume
 ```
 
 ---
 
-## Part 4: Pipeline Parallelism Limitation
+## Part 6: Pipeline Parallelism Limitation
 
-**Documented behavior:** With PP > 1, MoE stats only reflect layers on the logging rank (last PP stage). Earlier stage stats are not aggregated.
-
-To get full stats with PP, each rank would need to log separately with prefix `moe/pp{rank}/...`. This is out of scope for v3.
+**Documented behavior:** With PP > 1, MoE stats only reflect layers on the logging rank (last PP stage).
 
 ---
 
 ## Files Changed
 
 
-| File           | Changes                                                      |
-| -------------- | ------------------------------------------------------------ |
-| moe.py         | Return counts from loss fn, store `last_counts` (no .item()) |
-| train.py       | Add accumulator, collector, DP reduction, save_dir arg       |
-| modal_train.py | Mount ddp-traces volume, add save_interval and save_dir      |
+| File           | Changes                                                           |
+| -------------- | ----------------------------------------------------------------- |
+| moe.py         | Return counts from loss fn, store `last_counts`                   |
+| train.py       | MoE accumulator, profiler with WandB upload, HF checkpoint upload |
+| modal_train.py | Mount ddp-traces, add hf-secret, enable profiler and HF args      |
 
 
 ---
@@ -264,7 +355,29 @@ To get full stats with PP, each rank would need to log separately with prefix `m
 - `moe/load_std`, `moe/load_min`, `moe/load_max`, `moe/load_imbalance`
 - `moe/expert_load_distribution` histogram (every 100 steps)
 
-**ddp-traces Volume:**
+**WandB Artifacts:**
 
-- `ckpt_0000500.pt`, `ckpt_0001000.pt`, etc.
+- `trace-step-4`, `trace-step-5`, ... (JSON files viewable at ui.perfetto.dev)
+
+**Modal ddp-traces Volume:**
+
+- `trace_step_4.json`, `trace_step_5.json`, ... (backup copies)
+
+**HuggingFace Hub (TheFireHacker/moe-first-try):**
+
+- `checkpoints/checkpoint_step_0000500.pt`
+- `checkpoints/checkpoint_step_0001000.pt`
+- etc.
+
+---
+
+## Setup Required
+
+```bash
+# 1. Create HuggingFace secret in Modal
+modal secret create hf-secret HF_TOKEN=hf_your_token_here
+
+# 2. Ensure ddp-traces volume exists
+modal volume create ddp-traces
+```
 

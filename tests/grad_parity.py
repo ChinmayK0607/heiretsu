@@ -213,7 +213,8 @@ def main() -> None:
             print(f"[grad_parity] bumping n_layer from {args.n_layer} to {args.pp} to satisfy pp>n_layer constraint")
         args.n_layer = args.pp
 
-    device = torch.device("cuda", topo.rank) if torch.cuda.is_available() else torch.device("cpu")
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
     if device.type == "cuda":
         torch.cuda.set_device(device)
 

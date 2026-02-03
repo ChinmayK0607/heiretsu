@@ -4,18 +4,18 @@ Modal deployment for Heiretsu distributed training.
 
 Run with:
     modal run modal_train.py
-
-Or deploy as a scheduled job:
-    modal deploy modal_train.py
 """
 
 import modal
-import os
+from pathlib import Path
+
+# Get the local directory path
+LOCAL_DIR = Path(__file__).parent
 
 # Modal app definition
 app = modal.App("heiretsu-training")
 
-# Docker image with all dependencies
+# Docker image with all dependencies + local code
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
@@ -26,6 +26,14 @@ image = (
         "wandb",
     )
     .env({"TORCH_NCCL_SHOW_EAGER_INIT_P2P_SERIALIZATION_WARNING": "0"})
+    .add_local_file(LOCAL_DIR / "train.py", remote_path="/app/train.py")
+    .add_local_file(LOCAL_DIR / "gpt_model.py", remote_path="/app/gpt_model.py")
+    .add_local_file(LOCAL_DIR / "topo.py", remote_path="/app/topo.py")
+    .add_local_file(LOCAL_DIR / "dp.py", remote_path="/app/dp.py")
+    .add_local_file(LOCAL_DIR / "tp_linear.py", remote_path="/app/tp_linear.py")
+    .add_local_file(LOCAL_DIR / "pipeline.py", remote_path="/app/pipeline.py")
+    .add_local_file(LOCAL_DIR / "moe.py", remote_path="/app/moe.py")
+    .add_local_file(LOCAL_DIR / "ep_comm.py", remote_path="/app/ep_comm.py")
 )
 
 # Reference existing volumes and secrets
@@ -62,7 +70,7 @@ TRAINING_CONFIG = {
     "eval_interval": 100,
     "eval_iters": 50,
     # Data
-    "num_train_chunks": 10,  # Use 10 chunks (~1B tokens) for faster startup
+    "num_train_chunks": 9,  # Use 9 chunks (~900M tokens) - matches available data
     "num_val_chunks": 1,
 }
 
@@ -73,101 +81,9 @@ TRAINING_CONFIG = {
     timeout=3600,  # 1 hour max
     secrets=[wandb_secret],
     volumes={"/data": fineweb_volume},
-    _experimental_scheduler_placement=modal.scheduler_placement.Scheduler(
-        # Request all 4 GPUs on the same node for NCCL
-        zone="us-east-1",
-    ),
 )
 def train():
     """Run distributed training with torchrun."""
-    import subprocess
-    import sys
-    
-    # Copy training code to container
-    # (In production, you'd mount the code or include it in the image)
-    code_files = [
-        "train.py",
-        "gpt_model.py", 
-        "topo.py",
-        "dp.py",
-        "tp_linear.py",
-        "pipeline.py",
-        "moe.py",
-        "ep_comm.py",
-    ]
-    
-    # For now, we'll download from the mounted volume or include inline
-    # This example assumes the code is copied to /app
-    
-    # Build torchrun command
-    cfg = TRAINING_CONFIG
-    world_size = cfg["dp"] * cfg["tp"] * cfg["pp"] * cfg["ep"]
-    
-    cmd = [
-        sys.executable, "-m", "torch.distributed.run",
-        "--standalone",
-        f"--nproc_per_node={world_size}",
-        "train.py",
-        "--data_dir", "/data/fineweb10B",
-        f"--batch_size={cfg['batch_size']}",
-        f"--block_size={cfg['block_size']}",
-        f"--n_layer={cfg['n_layer']}",
-        f"--n_head={cfg['n_head']}",
-        f"--n_embed={cfg['n_embed']}",
-        f"--dropout={cfg['dropout']}",
-        f"--max_iters={cfg['max_iters']}",
-        f"--learning_rate={cfg['learning_rate']}",
-        f"--weight_decay={cfg['weight_decay']}",
-        f"--grad_clip={cfg['grad_clip']}",
-        f"--grad_accum_steps={cfg['grad_accum_steps']}",
-        f"--amp={cfg['amp']}",
-        f"--dp={cfg['dp']}",
-        f"--tp={cfg['tp']}",
-        f"--pp={cfg['pp']}",
-        f"--ep={cfg['ep']}",
-        f"--num_experts={cfg['num_experts']}",
-        f"--top_k={cfg['top_k']}",
-        f"--moe_freq={cfg['moe_freq']}",
-        f"--aux_loss_coef={cfg['aux_loss_coef']}",
-        f"--eval_interval={cfg['eval_interval']}",
-        f"--eval_iters={cfg['eval_iters']}",
-        f"--num_train_chunks={cfg['num_train_chunks']}",
-        f"--num_val_chunks={cfg['num_val_chunks']}",
-        "--wandb",
-        "--wandb_project=heiretsu-moe-training",
-        "--wandb_mode=online",
-        f"--run_name=heiretsu-moe-8k2-tp-fix",
-        "--seed=1337",
-    ]
-    
-    print(f"Running: {' '.join(cmd)}")
-    print(f"Config: DP={cfg['dp']} TP={cfg['tp']} PP={cfg['pp']} EP={cfg['ep']}")
-    print(f"Model: {cfg['n_layer']}L {cfg['n_head']}H {cfg['n_embed']}D")
-    print(f"MoE: {cfg['num_experts']} experts, top-{cfg['top_k']}")
-    print(f"Training: {cfg['max_iters']} steps, bs={cfg['batch_size']}, accum={cfg['grad_accum_steps']}")
-    
-    # Run training
-    result = subprocess.run(cmd, cwd="/app")
-    return result.returncode
-
-
-# Alternative: Mount local code directly
-@app.function(
-    image=image,
-    gpu="a100-40gb:4",
-    timeout=3600,
-    secrets=[wandb_secret],
-    volumes={"/data": fineweb_volume},
-    mounts=[
-        modal.Mount.from_local_dir(
-            ".",
-            remote_path="/app",
-            condition=lambda path: path.endswith(".py") and "modal" not in path,
-        )
-    ],
-)
-def train_with_local_code():
-    """Run distributed training with locally mounted code."""
     import subprocess
     import sys
     import os
@@ -182,7 +98,7 @@ def train_with_local_code():
         "--standalone",
         f"--nproc_per_node={world_size}",
         "train.py",
-        "--data_dir", "/data/fineweb10B",
+        "--data_dir", "/data",
         f"--batch_size={cfg['batch_size']}",
         f"--block_size={cfg['block_size']}",
         f"--n_layer={cfg['n_layer']}",
@@ -210,16 +126,21 @@ def train_with_local_code():
         "--wandb",
         "--wandb_project=heiretsu-moe-training",
         "--wandb_mode=online",
-        f"--run_name=heiretsu-moe-8k2-tp-fix",
+        "--run_name=heiretsu-moe-8k2-tp-fix",
         "--seed=1337",
     ]
     
-    print(f"Running: {' '.join(cmd)}")
+    print("=" * 60)
+    print("Heiretsu Training with TP Seeding Fix")
+    print("=" * 60)
     print(f"Config: DP={cfg['dp']} TP={cfg['tp']} PP={cfg['pp']} EP={cfg['ep']}")
     print(f"Model: {cfg['n_layer']}L {cfg['n_head']}H {cfg['n_embed']}D")
     print(f"MoE: {cfg['num_experts']} experts, top-{cfg['top_k']}")
-    print(f"Training: {cfg['max_iters']} steps")
+    print(f"Training: {cfg['max_iters']} steps, bs={cfg['batch_size']}, accum={cfg['grad_accum_steps']}")
+    print(f"Command: {' '.join(cmd)}")
+    print("=" * 60)
     
+    # Run training
     result = subprocess.run(cmd)
     return result.returncode
 
@@ -231,8 +152,7 @@ def main():
     print("Using TP seeding fix (SmolLM3 Playbook)")
     print("=" * 60)
     
-    # Use the version with local code mounting
-    returncode = train_with_local_code.remote()
+    returncode = train.remote()
     
     if returncode == 0:
         print("Training completed successfully!")

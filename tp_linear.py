@@ -100,6 +100,8 @@ class ColumnParallelLinear(nn.Module):
         tp_group: Optional[dist.ProcessGroup] = None,
         tp_rank: Optional[int] = None,
         tp_world_size: Optional[int] = None,
+        layer_idx: int = 0,
+        module_id: int = 0,
     ) -> None:
         super().__init__()
         self.in_features = in_features
@@ -107,6 +109,8 @@ class ColumnParallelLinear(nn.Module):
         self.tp_group = tp_group
         self.tp_world_size = tp_world_size if tp_world_size is not None else _tp_world_size(tp_group)
         self.tp_rank = tp_rank if tp_rank is not None else _tp_rank(tp_group)
+        self.layer_idx = layer_idx
+        self.module_id = module_id
         if out_features % self.tp_world_size != 0:
             raise ValueError(f"out_features {out_features} not divisible by tp {self.tp_world_size}")
         self.out_per_partition = out_features // self.tp_world_size
@@ -116,21 +120,29 @@ class ColumnParallelLinear(nn.Module):
         else:
             self.bias = None
 
-    def reset_parameters(self, std: float = 0.02) -> None:
-        # Initialize from full weight for parity with non-TP initialization.
-        full_w = torch.empty(self.out_features, self.in_features, device="cpu")
-        nn.init.normal_(full_w, mean=0.0, std=std)
-        start = self.tp_rank * self.out_per_partition
-        end = start + self.out_per_partition
-        shard = full_w[start:end].to(self.weight.device)
+    def reset_parameters(self, std: float = 0.02, base_seed: int = 1337) -> None:
+        """Initialize local shard with unique seed per TP-rank, layer, and module.
+        
+        Seed = base_seed + tp_rank * 1000000 + layer_idx * 100 + module_id
+        This ensures diversity across TP shards (SmolLM3 fix) while maintaining
+        uniqueness across layers and modules.
+        """
+        seed = base_seed + self.tp_rank * 1000000 + self.layer_idx * 100 + self.module_id
+        
+        # Device-aware generator
+        device = self.weight.device
+        if device.type == "cuda":
+            gen = torch.Generator(device=device)
+        else:
+            gen = torch.Generator()
+        gen.manual_seed(seed)
+        
+        # Initialize local shard directly (no full matrix allocation)
         with torch.no_grad():
-            self.weight.copy_(shard)
+            self.weight.normal_(mean=0.0, std=std, generator=gen)
+        
         if self.bias is not None:
-            full_b = torch.empty(self.out_features, device="cpu")
-            nn.init.zeros_(full_b)
-            b_shard = full_b[start:end].to(self.weight.device)
-            with torch.no_grad():
-                self.bias.copy_(b_shard)
+            nn.init.zeros_(self.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Column-parallel forward: input is replicated, output is sharded.
@@ -173,6 +185,8 @@ class ColumnParallelLinearQKV(nn.Module):
         tp_group: Optional[dist.ProcessGroup] = None,
         tp_rank: Optional[int] = None,
         tp_world_size: Optional[int] = None,
+        layer_idx: int = 0,
+        module_id: int = 0,
     ) -> None:
         super().__init__()
         self.in_features = in_features
@@ -180,6 +194,8 @@ class ColumnParallelLinearQKV(nn.Module):
         self.tp_group = tp_group
         self.tp_world_size = tp_world_size if tp_world_size is not None else _tp_world_size(tp_group)
         self.tp_rank = tp_rank if tp_rank is not None else _tp_rank(tp_group)
+        self.layer_idx = layer_idx
+        self.module_id = module_id
         if out_features % self.tp_world_size != 0:
             raise ValueError(f"out_features {out_features} not divisible by tp {self.tp_world_size}")
         self.out_per_partition = out_features // self.tp_world_size
@@ -189,29 +205,27 @@ class ColumnParallelLinearQKV(nn.Module):
         else:
             self.bias = None
 
-    def reset_parameters(self, std: float = 0.02) -> None:
-        # Initialize from full QKV weight for parity with non-TP initialization.
-        full_w = torch.empty(3 * self.out_features, self.in_features, device="cpu")
-        nn.init.normal_(full_w, mean=0.0, std=std)
-        shards = []
-        for i in range(3):
-            start = i * self.out_features + self.tp_rank * self.out_per_partition
-            end = start + self.out_per_partition
-            shards.append(full_w[start:end])
-        shard = torch.cat(shards, dim=0).to(self.weight.device)
+    def reset_parameters(self, std: float = 0.02, base_seed: int = 1337) -> None:
+        """Initialize local shard with unique seed per TP-rank, layer, and module.
+        
+        Seed = base_seed + tp_rank * 1000000 + layer_idx * 100 + module_id
+        """
+        seed = base_seed + self.tp_rank * 1000000 + self.layer_idx * 100 + self.module_id
+        
+        # Device-aware generator
+        device = self.weight.device
+        if device.type == "cuda":
+            gen = torch.Generator(device=device)
+        else:
+            gen = torch.Generator()
+        gen.manual_seed(seed)
+        
+        # Initialize local shard directly (no full matrix allocation)
         with torch.no_grad():
-            self.weight.copy_(shard)
+            self.weight.normal_(mean=0.0, std=std, generator=gen)
+        
         if self.bias is not None:
-            full_b = torch.empty(3 * self.out_features, device="cpu")
-            nn.init.zeros_(full_b)
-            b_shards = []
-            for i in range(3):
-                start = i * self.out_features + self.tp_rank * self.out_per_partition
-                end = start + self.out_per_partition
-                b_shards.append(full_b[start:end])
-            b_shard = torch.cat(b_shards, dim=0).to(self.bias.device)
-            with torch.no_grad():
-                self.bias.copy_(b_shard)
+            nn.init.zeros_(self.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Column-parallel QKV forward: input is replicated, output is sharded.
@@ -244,6 +258,8 @@ class RowParallelLinear(nn.Module):
         tp_group: Optional[dist.ProcessGroup] = None,
         tp_rank: Optional[int] = None,
         tp_world_size: Optional[int] = None,
+        layer_idx: int = 0,
+        module_id: int = 0,
     ) -> None:
         super().__init__()
         self.in_features = in_features
@@ -251,6 +267,8 @@ class RowParallelLinear(nn.Module):
         self.tp_group = tp_group
         self.tp_world_size = tp_world_size if tp_world_size is not None else _tp_world_size(tp_group)
         self.tp_rank = tp_rank if tp_rank is not None else _tp_rank(tp_group)
+        self.layer_idx = layer_idx
+        self.module_id = module_id
         if in_features % self.tp_world_size != 0:
             raise ValueError(f"in_features {in_features} not divisible by tp {self.tp_world_size}")
         self.in_per_partition = in_features // self.tp_world_size
@@ -260,20 +278,27 @@ class RowParallelLinear(nn.Module):
         else:
             self.bias = None
 
-    def reset_parameters(self, std: float = 0.02) -> None:
-        # Initialize from full weight for parity with non-TP initialization.
-        full_w = torch.empty(self.out_features, self.in_features, device="cpu")
-        nn.init.normal_(full_w, mean=0.0, std=std)
-        start = self.tp_rank * self.in_per_partition
-        end = start + self.in_per_partition
-        shard = full_w[:, start:end].to(self.weight.device)
+    def reset_parameters(self, std: float = 0.02, base_seed: int = 1337) -> None:
+        """Initialize local shard with unique seed per TP-rank, layer, and module.
+        
+        Seed = base_seed + tp_rank * 1000000 + layer_idx * 100 + module_id
+        """
+        seed = base_seed + self.tp_rank * 1000000 + self.layer_idx * 100 + self.module_id
+        
+        # Device-aware generator
+        device = self.weight.device
+        if device.type == "cuda":
+            gen = torch.Generator(device=device)
+        else:
+            gen = torch.Generator()
+        gen.manual_seed(seed)
+        
+        # Initialize local shard directly (no full matrix allocation)
         with torch.no_grad():
-            self.weight.copy_(shard)
+            self.weight.normal_(mean=0.0, std=std, generator=gen)
+        
         if self.bias is not None:
-            full_b = torch.empty(self.out_features, device="cpu")
-            nn.init.zeros_(full_b)
-            with torch.no_grad():
-                self.bias.copy_(full_b.to(self.bias.device))
+            nn.init.zeros_(self.bias)
 
     def forward(self, x: torch.Tensor, input_is_parallel: Optional[bool] = None) -> torch.Tensor:
         # Row-parallel forward: input is sharded, output is replicated (all-reduced).

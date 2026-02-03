@@ -104,7 +104,8 @@ class StageModule(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             else:
-                m.reset_parameters(std=std)
+                # Pass init_seed to TP linear layers for per-rank diversity
+                m.reset_parameters(std=std, base_seed=self.cfg.init_seed)
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
 

@@ -28,10 +28,12 @@ class GPTConfig:
     top_k: int = 2             # experts per token
     moe_freq: int = 2          # MoE every N layers (0 = all dense)
     aux_loss_coef: float = 0.01  # load balancing loss coefficient
+    # Init config
+    init_seed: int = 1337      # Base seed for TP weight init (per-layer/module uniqueness)
 
 
 class AttentionTP(nn.Module):
-    def __init__(self, cfg: GPTConfig, tp_group=None, tp_rank: int = 0, tp_world_size: int = 1):
+    def __init__(self, cfg: GPTConfig, layer_idx: int = 0, tp_group=None, tp_rank: int = 0, tp_world_size: int = 1):
         super().__init__()
         assert cfg.n_embed % cfg.n_head == 0
         if cfg.n_embed % tp_world_size != 0:
@@ -47,8 +49,9 @@ class AttentionTP(nn.Module):
         self.dh = cfg.n_embed // cfg.n_head
         self.h_tp = cfg.n_embed // tp_world_size
 
-        self.c_attn = ColumnParallelLinearQKV(cfg.n_embed, cfg.n_embed, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp_world_size)
-        self.c_proj = RowParallelLinear(cfg.n_embed, cfg.n_embed, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp_world_size)
+        # module_id: 0=c_attn, 1=c_proj (attention)
+        self.c_attn = ColumnParallelLinearQKV(cfg.n_embed, cfg.n_embed, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp_world_size, layer_idx=layer_idx, module_id=0)
+        self.c_proj = RowParallelLinear(cfg.n_embed, cfg.n_embed, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp_world_size, layer_idx=layer_idx, module_id=1)
         self.c_proj.NANOGPT_SCALE_INIT = 1
         self.attn_drop = nn.Dropout(cfg.dropout)
         self.resid_drop = nn.Dropout(cfg.dropout)
@@ -87,11 +90,12 @@ class AttentionTP(nn.Module):
         return y
 
 class MLPTP(nn.Module):
-    def __init__(self, cfg: GPTConfig, tp_group=None, tp_rank: int = 0, tp_world_size: int = 1):
+    def __init__(self, cfg: GPTConfig, layer_idx: int = 0, tp_group=None, tp_rank: int = 0, tp_world_size: int = 1):
         super().__init__()
-        self.c_fc = ColumnParallelLinear(cfg.n_embed, 4 * cfg.n_embed, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp_world_size)
+        # module_id: 2=c_fc (MLP), 3=c_proj (MLP)
+        self.c_fc = ColumnParallelLinear(cfg.n_embed, 4 * cfg.n_embed, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp_world_size, layer_idx=layer_idx, module_id=2)
         self.gelu = nn.GELU(approximate="tanh")
-        self.c_proj = RowParallelLinear(4 * cfg.n_embed, cfg.n_embed, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp_world_size)
+        self.c_proj = RowParallelLinear(4 * cfg.n_embed, cfg.n_embed, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp_world_size, layer_idx=layer_idx, module_id=3)
         self.c_proj.NANOGPT_SCALE_INIT = 1
         self.drop = nn.Dropout(cfg.dropout)
 
@@ -106,12 +110,12 @@ class MLPTP(nn.Module):
 
 
 class BlockTP(nn.Module):
-    def __init__(self, cfg: GPTConfig, tp_group=None, tp_rank: int = 0, tp_world_size: int = 1):
+    def __init__(self, cfg: GPTConfig, layer_idx: int = 0, tp_group=None, tp_rank: int = 0, tp_world_size: int = 1):
         super().__init__()
         self.ln_1 = nn.LayerNorm(cfg.n_embed)
-        self.attn = AttentionTP(cfg, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp_world_size)
+        self.attn = AttentionTP(cfg, layer_idx=layer_idx, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp_world_size)
         self.ln_2 = nn.LayerNorm(cfg.n_embed)
-        self.mlp = MLPTP(cfg, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp_world_size)
+        self.mlp = MLPTP(cfg, layer_idx=layer_idx, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp_world_size)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Returns (hidden, aux_loss) for consistency with BlockMoE. aux_loss=0 for dense blocks."""
@@ -127,7 +131,8 @@ class BlockMoE(nn.Module):
     
     def __init__(
         self, 
-        cfg: GPTConfig, 
+        cfg: GPTConfig,
+        layer_idx: int = 0,
         tp_group=None, 
         tp_rank: int = 0, 
         tp_world_size: int = 1,
@@ -137,7 +142,7 @@ class BlockMoE(nn.Module):
     ):
         super().__init__()
         self.ln_1 = nn.LayerNorm(cfg.n_embed)
-        self.attn = AttentionTP(cfg, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp_world_size)
+        self.attn = AttentionTP(cfg, layer_idx=layer_idx, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp_world_size)
         self.ln_2 = nn.LayerNorm(cfg.n_embed)
         
         # MoE layer replaces MLPTP
@@ -189,7 +194,8 @@ def make_block(
     
     if use_moe:
         return BlockMoE(
-            cfg, 
+            cfg,
+            layer_idx=layer_idx,
             tp_group=tp_group, 
             tp_rank=tp_rank, 
             tp_world_size=tp_world_size,
@@ -199,7 +205,8 @@ def make_block(
         )
     else:
         return BlockTP(
-            cfg, 
+            cfg,
+            layer_idx=layer_idx,
             tp_group=tp_group, 
             tp_rank=tp_rank, 
             tp_world_size=tp_world_size,
@@ -253,7 +260,8 @@ class GPT(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             else:
-                m.reset_parameters(std=std)
+                # Pass init_seed to TP linear layers for per-rank diversity
+                m.reset_parameters(std=std, base_seed=self.cfg.init_seed)
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
 

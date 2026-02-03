@@ -131,7 +131,7 @@ def estimate_loss(model, loader, eval_iters, device, amp_mode: str) -> float:
     with ctx:
         for _ in range(eval_iters):
             x, y = loader.next_batch(device)
-            _, loss = model(x, y)
+            _, loss, _ = model(x, y)  # (logits, loss, aux_loss)
             losses.append(float(loss.item()))
     model.train()
     return sum(losses) / len(losses)
@@ -339,9 +339,9 @@ def main():
     if is_main:
         print(f"device={device} | world_size={world_size} | dp={topo.dp} ep={topo.ep} tp={topo.tp} pp={topo.pp}")
 
-    # wandb
+    # wandb - only init on main rank
     run = None
-    if args.wandb and WANDB_AVAILABLE and args.wandb_mode != "disabled":
+    if is_main and args.wandb and WANDB_AVAILABLE and args.wandb_mode != "disabled":
         run = wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity if args.wandb_entity else None,
@@ -349,7 +349,7 @@ def main():
             mode=args.wandb_mode,
             name=args.run_name if args.run_name else None,
         )
-    elif args.wandb and not WANDB_AVAILABLE:
+    elif is_main and args.wandb and not WANDB_AVAILABLE:
         print("wandb not available; proceeding without external logging.")
 
     # training

@@ -258,10 +258,12 @@ def main():
     rank = topo.rank
     world_size = topo.world_size
 
-    # model init must be identical across DP ranks -> seed with base seed only
-    torch.manual_seed(args.seed)
+    # Model init: use different seed per TP rank to avoid correlated initialization
+    # (SmolLM3 Playbook fix - identical seeds across TP ranks hurt convergence)
+    init_seed = args.seed + topo.tp_rank
+    torch.manual_seed(init_seed)
     if device.type == "cuda":
-        torch.cuda.manual_seed_all(args.seed)
+        torch.cuda.manual_seed_all(init_seed)
 
     # model / stage init (with MoE config)
     cfg = GPTConfig(

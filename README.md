@@ -105,3 +105,54 @@ PASS (6):
   dp=1 tp=2 pp=2 (diff=1.19e-07)
 FAIL (0):
 ```
+
+---
+
+## Modal Cloud Training
+
+Run distributed training on Modal with 4x A100 GPUs.
+
+### Prerequisites
+
+1. Install Modal CLI:
+```bash
+pip install modal
+modal setup
+```
+
+2. Ensure you have these Modal resources configured:
+   - **Volume**: `fineweb-data` (with FineWeb10B data)
+   - **Secret**: `wandb-secret` (with `WANDB_API_KEY`)
+
+### Run Training
+
+```bash
+cd heiretsu
+modal run modal_train.py
+```
+
+### Default Configuration
+
+| Setting | Value |
+|---------|-------|
+| GPUs | 4x A100-40GB |
+| Model | GPT-2 Medium (24L/16H/1024D, ~355M params) |
+| MoE | 8 experts, top-2, every 2 layers |
+| Parallelism | DP=2, TP=2 |
+| Batch | 8 per GPU, grad_accum=4 |
+| Steps | 2000 |
+| Precision | bf16 |
+
+Results are logged to WandB project `heiretsu-moe-training`.
+
+### Customization
+
+Edit `TRAINING_CONFIG` in `modal_train.py` to change:
+- Model size (`n_layer`, `n_head`, `n_embed`)
+- Parallelism dimensions (`dp`, `tp`, `pp`, `ep`)
+- MoE settings (`num_experts`, `top_k`, `moe_freq`)
+- Training hyperparameters
+
+### Estimated Cost
+
+~$3-5 for 2000 steps (~25-30 minutes on 4x A100-40GB)

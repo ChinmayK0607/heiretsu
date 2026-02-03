@@ -55,7 +55,7 @@ else:
 dist.broadcast(x_bcast, src=0)
 
 with torch.no_grad():
-    logits, _ = model(x_bcast)
+    logits, _, _ = model(x_bcast)
 
 # gather reference logits from rank0 and compute local diff
 logits_ref = logits.detach().clone()

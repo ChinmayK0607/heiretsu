@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Data
+data/fineweb10B/
+*.npy
+
+# Logs
+tests/logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Misc
+.DS_Store

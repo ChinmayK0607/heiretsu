@@ -178,6 +178,7 @@ def load_stage_from_full_state(stage: StageModule, full_state: dict, tp_rank: in
 def main() -> None:
     p = argparse.ArgumentParser(description="Gradient parity test for DP/TP/PP")
     p.add_argument("--dp", type=int, default=1)
+    p.add_argument("--ep", type=int, default=1)
     p.add_argument("--tp", type=int, default=1)
     p.add_argument("--pp", type=int, default=1)
     p.add_argument("--backend", type=str, default="nccl")
@@ -188,13 +189,18 @@ def main() -> None:
     p.add_argument("--n_head", type=int, default=4)
     p.add_argument("--n_embed", type=int, default=64)
     p.add_argument("--vocab_size", type=int, default=256)
+    # MoE arguments
+    p.add_argument("--num_experts", type=int, default=0, help="Number of experts (0=dense)")
+    p.add_argument("--top_k", type=int, default=2)
+    p.add_argument("--moe_freq", type=int, default=2, help="MoE layer frequency")
+    p.add_argument("--aux_loss_coef", type=float, default=0.01)
     args = p.parse_args()
 
     if args.backend == "nccl" and not torch.cuda.is_available():
         args.backend = "gloo"
 
     dist.init_process_group(backend=args.backend)
-    topo = init_topology(dp=args.dp, tp=args.tp, pp=args.pp)
+    topo = init_topology(dp=args.dp, ep=args.ep, tp=args.tp, pp=args.pp)
 
     # Ensure pipeline partitioning is valid: must have n_layer >= pp
     if args.pp > args.n_layer:
@@ -215,6 +221,10 @@ def main() -> None:
         n_head=args.n_head,
         n_embed=args.n_embed,
         dropout=0.0,
+        num_experts=args.num_experts,
+        top_k=args.top_k,
+        moe_freq=args.moe_freq,
+        aux_loss_coef=args.aux_loss_coef,
     )
 
     # synthetic batch (broadcast to all ranks)
@@ -258,7 +268,7 @@ def main() -> None:
         engine = GPipeEngine(stage, topo)
         load_stage_from_full_state(stage, base_state, topo.tp_rank, topo.tp)
         stage.train()
-        loss = engine.forward_backward(
+        loss, _ = engine.forward_backward(
             loader=_LoaderAdapter(x, y),
             micro_batches=1,
             device=device,
@@ -273,8 +283,8 @@ def main() -> None:
         model = GPT(cfg, topo=topo).to(device)
         load_gpt_from_full_state(model, base_state, topo.tp_rank, topo.tp)
         model.train()
-        _, loss = model(x, y)
-        loss.backward()
+        _, loss, aux = model(x, y)
+        (loss + aux).backward()
         average_gradients(model, topo.dp_group)
         local_module = model
 

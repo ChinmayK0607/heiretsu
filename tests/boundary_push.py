@@ -38,6 +38,7 @@ class RandomTokenLoader:
 def main():
     p = argparse.ArgumentParser(description="Boundary-pushing test for DP/TP/PP")
     p.add_argument("--dp", type=int, default=1)
+    p.add_argument("--ep", type=int, default=1)
     p.add_argument("--tp", type=int, default=1)
     p.add_argument("--pp", type=int, default=1)
     p.add_argument("--steps", type=int, default=5)
@@ -52,6 +53,11 @@ def main():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--backend", type=str, default="nccl")
+    # MoE arguments
+    p.add_argument("--num_experts", type=int, default=0, help="Number of experts (0=dense)")
+    p.add_argument("--top_k", type=int, default=2)
+    p.add_argument("--moe_freq", type=int, default=2, help="MoE layer frequency")
+    p.add_argument("--aux_loss_coef", type=float, default=0.01)
     p.add_argument(
         "--progress_interval",
         type=int,
@@ -64,7 +70,7 @@ def main():
         args.backend = "gloo"
 
     dist.init_process_group(backend=args.backend)
-    topo = init_topology(dp=args.dp, tp=args.tp, pp=args.pp)
+    topo = init_topology(dp=args.dp, ep=args.ep, tp=args.tp, pp=args.pp)
 
     device = torch.device("cuda", topo.rank) if torch.cuda.is_available() else torch.device("cpu")
     if device.type == "cuda":
@@ -84,6 +90,10 @@ def main():
         n_head=args.n_head,
         n_embed=args.n_embed,
         dropout=args.dropout,
+        num_experts=args.num_experts,
+        top_k=args.top_k,
+        moe_freq=args.moe_freq,
+        aux_loss_coef=args.aux_loss_coef,
     )
 
     use_pipeline = topo.pp > 1
@@ -102,7 +112,7 @@ def main():
     local_module.train()
     for step in range(1, args.steps + 1):
         if use_pipeline:
-            loss_scalar = engine.forward_backward(
+            loss_scalar, _ = engine.forward_backward(
                 loader,
                 micro_batches=args.micro_batches,
                 device=device,
@@ -114,8 +124,8 @@ def main():
         else:
             for _ in range(args.micro_batches):
                 x, y = loader.next_batch(device)
-                _, loss = local_module(x, y)
-                (loss / args.micro_batches).backward()
+                _, loss, aux = local_module(x, y)
+                ((loss + aux) / args.micro_batches).backward()
             loss_scalar = loss.detach().float()
 
         average_gradients(local_module, topo.dp_group)
@@ -126,7 +136,7 @@ def main():
         if use_pipeline and topo.pp > 1:
             # Determine the rank of the canonical last stage (dp_rank=0, tp_rank=0, pp_rank=pp-1)
             from topo import rank_from_coords
-            last_stage_rank = rank_from_coords(0, topo.pp - 1, 0, topo.dp, topo.tp, topo.pp)
+            last_stage_rank = rank_from_coords(0, 0, topo.pp - 1, 0, topo.dp, topo.ep, topo.tp, topo.pp)
             if engine.is_last and topo.dp_rank == 0 and topo.tp_rank == 0 and topo.rank != 0:
                 # Last stage sends loss to rank 0
                 dist.send(loss_scalar.unsqueeze(0), dst=0, tag=4000 + step)

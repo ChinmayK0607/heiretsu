@@ -32,7 +32,7 @@ def build_ref_logits(cfg: GPTConfig, x: torch.Tensor, y: torch.Tensor, device: t
     model = GPT(cfg).to(device)
     model.eval()
     with torch.no_grad():
-        logits, loss = model(x, y)
+        logits, loss, _ = model(x, y)
     return logits, loss, model.state_dict()
 
 
@@ -118,31 +118,32 @@ def pp_forward_logits(stage: StageModule, topo, x: torch.Tensor, y: torch.Tensor
     if stage.is_first:
         with torch.no_grad():
             h = stage.embed(x)
-            h = stage.forward_blocks(h)
+            h, _ = stage.forward_blocks(h)
         if topo.pp_rank < topo.pp - 1:
-            dist.send(h, dst=rank_from_coords(topo.dp_rank, topo.pp_rank + 1, topo.tp_rank, topo.dp, topo.tp, topo.pp), tag=1000)
+            dist.send(h, dst=rank_from_coords(topo.dp_rank, topo.ep_rank, topo.pp_rank + 1, topo.tp_rank, topo.dp, topo.ep, topo.tp, topo.pp), tag=1000)
         return None
 
     if stage.is_last:
         h = torch.empty((B, T, H), device=device)
-        dist.recv(h, src=rank_from_coords(topo.dp_rank, topo.pp_rank - 1, topo.tp_rank, topo.dp, topo.tp, topo.pp), tag=1000)
+        dist.recv(h, src=rank_from_coords(topo.dp_rank, topo.ep_rank, topo.pp_rank - 1, topo.tp_rank, topo.dp, topo.ep, topo.tp, topo.pp), tag=1000)
         with torch.no_grad():
-            h = stage.forward_blocks(h)
+            h, _ = stage.forward_blocks(h)
             logits, _ = stage.forward_head(h, y)
         return logits
 
     # middle stage
     h = torch.empty((B, T, H), device=device)
-    dist.recv(h, src=rank_from_coords(topo.dp_rank, topo.pp_rank - 1, topo.tp_rank, topo.dp, topo.tp, topo.pp), tag=1000)
+    dist.recv(h, src=rank_from_coords(topo.dp_rank, topo.ep_rank, topo.pp_rank - 1, topo.tp_rank, topo.dp, topo.ep, topo.tp, topo.pp), tag=1000)
     with torch.no_grad():
-        h = stage.forward_blocks(h)
-    dist.send(h, dst=rank_from_coords(topo.dp_rank, topo.pp_rank + 1, topo.tp_rank, topo.dp, topo.tp, topo.pp), tag=1000)
+        h, _ = stage.forward_blocks(h)
+    dist.send(h, dst=rank_from_coords(topo.dp_rank, topo.ep_rank, topo.pp_rank + 1, topo.tp_rank, topo.dp, topo.ep, topo.tp, topo.pp), tag=1000)
     return None
 
 
 def main():
     p = argparse.ArgumentParser(description="DP/TP/PP forward+backward sanity with logit diff")
     p.add_argument("--dp", type=int, default=1)
+    p.add_argument("--ep", type=int, default=1)
     p.add_argument("--tp", type=int, default=1)
     p.add_argument("--pp", type=int, default=1)
     p.add_argument("--backend", type=str, default="nccl")
@@ -154,13 +155,18 @@ def main():
     p.add_argument("--n_embed", type=int, default=64)
     p.add_argument("--vocab_size", type=int, default=256)
     p.add_argument("--dropout", type=float, default=0.0)
+    # MoE arguments
+    p.add_argument("--num_experts", type=int, default=0, help="Number of experts (0=dense)")
+    p.add_argument("--top_k", type=int, default=2)
+    p.add_argument("--moe_freq", type=int, default=2, help="MoE layer frequency")
+    p.add_argument("--aux_loss_coef", type=float, default=0.01)
     args = p.parse_args()
 
     if args.backend == "nccl" and not torch.cuda.is_available():
         args.backend = "gloo"
 
     dist.init_process_group(backend=args.backend)
-    topo = init_topology(dp=args.dp, tp=args.tp, pp=args.pp)
+    topo = init_topology(dp=args.dp, ep=args.ep, tp=args.tp, pp=args.pp)
 
     device = torch.device("cuda", topo.rank) if torch.cuda.is_available() else torch.device("cpu")
     if device.type == "cuda":
@@ -175,6 +181,10 @@ def main():
         n_head=args.n_head,
         n_embed=args.n_embed,
         dropout=args.dropout,
+        num_experts=args.num_experts,
+        top_k=args.top_k,
+        moe_freq=args.moe_freq,
+        aux_loss_coef=args.aux_loss_coef,
     )
 
     # synthetic batch, broadcast to all ranks for comparability
@@ -217,7 +227,7 @@ def main():
             dist.send(logits, dst=0, tag=2000)
         if topo.rank == 0:
             # receive logits from last stage (dp_rank=0, tp_rank=0)
-            last_rank = rank_from_coords(0, topo.pp - 1, 0, topo.dp, topo.tp, topo.pp)
+            last_rank = rank_from_coords(0, 0, topo.pp - 1, 0, topo.dp, topo.ep, topo.tp, topo.pp)
             recv = torch.empty_like(ref_logits)
             dist.recv(recv, src=last_rank, tag=2000)
             logits = recv
@@ -227,7 +237,7 @@ def main():
         model = GPT(cfg, topo=topo).to(device)
         model.eval()
         with torch.no_grad():
-            logits, loss = model(x, y)
+            logits, loss, _ = model(x, y)
         if topo.rank == 0:
             ref_loss = ref_loss  # keep for prints
 
@@ -244,15 +254,17 @@ def main():
         stage = StageModule(cfg, topo, topo.pp_rank, topo.pp).to(device)
         stage.train()
 
-        prev_rank = rank_from_coords(topo.dp_rank, topo.pp_rank - 1, topo.tp_rank, topo.dp, topo.tp, topo.pp) if not stage.is_first else None
-        next_rank = rank_from_coords(topo.dp_rank, topo.pp_rank + 1, topo.tp_rank, topo.dp, topo.tp, topo.pp) if not stage.is_last else None
+        prev_rank = rank_from_coords(topo.dp_rank, topo.ep_rank, topo.pp_rank - 1, topo.tp_rank, topo.dp, topo.ep, topo.tp, topo.pp) if not stage.is_first else None
+        next_rank = rank_from_coords(topo.dp_rank, topo.ep_rank, topo.pp_rank + 1, topo.tp_rank, topo.dp, topo.ep, topo.tp, topo.pp) if not stage.is_last else None
 
         B, T, H = args.batch_size, args.block_size, cfg.n_embed
 
         if stage.is_first:
             # first stage: forward embeddings/blocks, send activations, receive grad from next stage
             h = stage.embed(x)
-            h = stage.forward_blocks(h)
+            h, aux = stage.forward_blocks(h)
+            if aux.requires_grad:
+                aux.backward(retain_graph=True)
             h.requires_grad_(True)
             dist.send(h, dst=next_rank, tag=3000)
 
@@ -266,9 +278,10 @@ def main():
             dist.recv(h_in, src=prev_rank, tag=3000)
             h_in.requires_grad_(True)
 
-            h_out = stage.forward_blocks(h_in)
+            h_out, aux = stage.forward_blocks(h_in)
             logits, loss = stage.forward_head(h_out, y)
-            loss.backward()
+            total_loss = loss + aux
+            total_loss.backward()
 
             dist.send(h_in.grad, dst=prev_rank, tag=3001)
 
@@ -278,12 +291,14 @@ def main():
             dist.recv(h_in, src=prev_rank, tag=3000)
             h_in.requires_grad_(True)
 
-            h_out = stage.forward_blocks(h_in)
+            h_out, aux = stage.forward_blocks(h_in)
             dist.send(h_out, dst=next_rank, tag=3000)
 
             grad_out = torch.empty_like(h_out)
             dist.recv(grad_out, src=next_rank, tag=3001)
 
+            if aux.requires_grad:
+                aux.backward(retain_graph=True)
             h_out.backward(grad_out)
             dist.send(h_in.grad, dst=prev_rank, tag=3001)
 
@@ -292,8 +307,8 @@ def main():
     else:
         model = GPT(cfg, topo=topo).to(device)
         model.train()
-        logits, loss = model(x, y)
-        loss.backward()
+        logits, loss, aux = model(x, y)
+        (loss + aux).backward()
         average_gradients(model, topo.dp_group)
 
     # Synchronize all ranks before printing and cleanup

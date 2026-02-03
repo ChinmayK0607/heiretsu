@@ -200,12 +200,19 @@ def main():
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
     p.add_argument("--seed", type=int, default=1337)
 
-    # parallelism topo (DP/TP/PP)
+    # parallelism topo (DP/EP/TP/PP)
     p.add_argument("--dp", type=int, default=1, help="Data parallel degree")
+    p.add_argument("--ep", type=int, default=1, help="Expert parallel degree (MoE)")
     p.add_argument("--tp", type=int, default=1, help="Tensor parallel degree")
     p.add_argument("--pp", type=int, default=1, help="Pipeline parallel degree")
     p.add_argument("--dp_share_data", action="store_true", help="Force all DP ranks to read identical data (parity/debug)")
     p.add_argument("--dist_backend", type=str, default="nccl", choices=["nccl", "gloo"], help="torch.distributed backend")
+
+    # MoE config
+    p.add_argument("--num_experts", type=int, default=0, help="Number of experts (0=dense model)")
+    p.add_argument("--top_k", type=int, default=2, help="Experts per token")
+    p.add_argument("--moe_freq", type=int, default=2, help="MoE every N layers (0=all dense)")
+    p.add_argument("--aux_loss_coef", type=float, default=0.01, help="MoE load balancing loss coefficient")
 
     # wandb
     p.add_argument("--wandb", action="store_true")
@@ -247,7 +254,7 @@ def main():
         rank = 0
         world_size = 1
 
-    topo = init_topology(dp=args.dp, tp=args.tp, pp=args.pp)
+    topo = init_topology(dp=args.dp, ep=args.ep, tp=args.tp, pp=args.pp)
     rank = topo.rank
     world_size = topo.world_size
 
@@ -256,13 +263,18 @@ def main():
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
 
-    # model / stage init
+    # model / stage init (with MoE config)
     cfg = GPTConfig(
         block_size=args.block_size,
         n_layer=args.n_layer,
         n_head=args.n_head,
         n_embed=args.n_embed,
         dropout=args.dropout,
+        # MoE config
+        num_experts=args.num_experts,
+        top_k=args.top_k,
+        moe_freq=args.moe_freq,
+        aux_loss_coef=args.aux_loss_coef,
     )
     use_pipeline = topo.pp > 1
     if use_pipeline:
@@ -273,6 +285,11 @@ def main():
         model = GPT(cfg, topo=topo).to(device)
         engine = None
         local_module = model
+    
+    # Log MoE info
+    if rank == 0 and args.num_experts > 0:
+        moe_layers = sum(1 for i in range(args.n_layer) if args.moe_freq > 0 and (i + 1) % args.moe_freq == 0)
+        print(f"[MoE] num_experts={args.num_experts}, top_k={args.top_k}, moe_layers={moe_layers}/{args.n_layer}, ep={args.ep}")
 
     # per-rank RNG:
     # - data RNG keyed by dp_rank so all PP/TP ranks within a DP replica share batches
@@ -320,7 +337,7 @@ def main():
             wandb.log(payload, step=step)
 
     if is_main:
-        print(f"device={device} | world_size={world_size} | dp={topo.dp} tp={topo.tp} pp={topo.pp}")
+        print(f"device={device} | world_size={world_size} | dp={topo.dp} ep={topo.ep} tp={topo.tp} pp={topo.pp}")
 
     # wandb
     run = None
@@ -345,7 +362,7 @@ def main():
 
     for step in range(1, args.max_iters + 1):
         if use_pipeline:
-            loss_scalar = engine.forward_backward(
+            loss_scalar, aux_loss = engine.forward_backward(
                 train_loader,
                 micro_batches=micro_in_macro,
                 device=device,
@@ -353,24 +370,32 @@ def main():
                 amp_dtype=amp_dtype,
                 scaler=scaler,
                 batch_size=args.batch_size,
+                aux_loss_coef=args.aux_loss_coef,
             )
         else:
             # accumulate on a single stage (DP/TP only)
+            total_aux_loss = torch.tensor(0.0, device=device)
             for _ in range(1, micro_in_macro + 1):
                 x, y = train_loader.next_batch(device)
                 with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                    _, loss = local_module(x, y)
-                    loss = loss / micro_in_macro
+                    _, loss, aux_loss = local_module(x, y)
+                    # Combined loss = data_loss + aux_loss (aux_loss already scaled by coef in MoE layer)
+                    combined_loss = (loss + aux_loss) / micro_in_macro
+                    total_aux_loss = total_aux_loss + aux_loss.detach()
 
                 if scaler.is_enabled():
-                    scaler.scale(loss).backward()
+                    scaler.scale(combined_loss).backward()
                 else:
-                    loss.backward()
+                    combined_loss.backward()
             loss_scalar = loss.detach().float()
+            aux_loss = total_aux_loss
 
         if loss_scalar is not None and topo.dp_group is not None and dist.is_initialized():
             dist.all_reduce(loss_scalar, op=dist.ReduceOp.SUM, group=topo.dp_group)
             loss_scalar = loss_scalar / dist.get_world_size(group=topo.dp_group)
+        if aux_loss is not None and topo.dp_group is not None and dist.is_initialized():
+            dist.all_reduce(aux_loss, op=dist.ReduceOp.SUM, group=topo.dp_group)
+            aux_loss = aux_loss / dist.get_world_size(group=topo.dp_group)
 
         # unscale first when using AMP
         if scaler.is_enabled():
@@ -397,13 +422,14 @@ def main():
         last_log_time = now
 
         if is_main and ((step % max(1, args.eval_interval // 10)) == 0 or step == 1):
+            aux_str = f" | aux_loss {aux_loss.item():.4f}" if args.num_experts > 0 else ""
             if loss_scalar is not None:
-                print(f"step {step:6d} | train_loss (mean micro) {loss_scalar.item():.4f} | eff_tok/s {eff_toks_per_sec:,.0f}")
+                print(f"step {step:6d} | train_loss (mean micro) {loss_scalar.item():.4f}{aux_str} | eff_tok/s {eff_toks_per_sec:,.0f}")
             else:
-                print(f"step {step:6d} | train_loss (mean micro) n/a | eff_tok/s {eff_toks_per_sec:,.0f}")
+                print(f"step {step:6d} | train_loss (mean micro) n/a{aux_str} | eff_tok/s {eff_toks_per_sec:,.0f}")
 
         if is_main and run:
-            wandb.log({
+            log_dict = {
                 "train/loss_mean_micro": float(loss_scalar.item()) if loss_scalar is not None else float("nan"),
                 "opt/lr": float(optimizer.param_groups[0]["lr"]),
                 "speed/eff_tokens_per_sec": eff_toks_per_sec,
@@ -411,7 +437,10 @@ def main():
                 "amp/mode": args.amp,
                 "accum/steps": args.grad_accum_steps,
                 "step": step,
-            }, step=step)
+            }
+            if args.num_experts > 0:
+                log_dict["train/aux_loss"] = float(aux_loss.item())
+            wandb.log(log_dict, step=step)
 
         # periodic eval
         if (step % args.eval_interval) == 0 or step == args.max_iters:
@@ -426,15 +455,16 @@ def main():
 
         # checkpointing
         if args.save_interval and (step % args.save_interval == 0) and (topo.dp_rank == 0):
-            if topo.tp == 1 and topo.pp == 1 and is_main:
+            if topo.tp == 1 and topo.pp == 1 and topo.ep == 1 and is_main:
                 torch.save({"model": local_module.state_dict(), "cfg": asdict(cfg), "step": step}, f"ckpt_{step:07d}.pt")
             else:
                 torch.save({
                     "model": local_module.state_dict(),
                     "cfg": asdict(cfg),
                     "step": step,
-                    "topo": {"dp": topo.dp, "tp": topo.tp, "pp": topo.pp, "pp_rank": topo.pp_rank, "tp_rank": topo.tp_rank},
-                }, f"ckpt_{step:07d}_pp{topo.pp_rank}_tp{topo.tp_rank}.pt")
+                    "topo": {"dp": topo.dp, "ep": topo.ep, "tp": topo.tp, "pp": topo.pp, 
+                             "pp_rank": topo.pp_rank, "tp_rank": topo.tp_rank, "ep_rank": topo.ep_rank},
+                }, f"ckpt_{step:07d}_pp{topo.pp_rank}_ep{topo.ep_rank}_tp{topo.tp_rank}.pt")
 
     if is_main and run:
         run.finish()

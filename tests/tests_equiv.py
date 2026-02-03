@@ -33,7 +33,7 @@ def main():
     if not dist.is_initialized():
         dist.init_process_group(backend=backend)
 
-    topo = init_topology(dp=args.dp, tp=args.tp, pp=args.pp)
+    topo = init_topology(dp=args.dp, ep=1, tp=args.tp, pp=args.pp)
     if topo.dp != 1 or topo.pp != 1:
         raise ValueError("tests_equiv.py currently supports dp=1, pp=1 only")
 
@@ -71,20 +71,20 @@ def main():
     dist.broadcast(x, src=0)
     dist.broadcast(y, src=0)
 
-    # forward
-    tp_logits, tp_loss = tp_model(x, y)
+    # forward (model now returns (logits, loss, aux_loss))
+    tp_logits, tp_loss, tp_aux = tp_model(x, y)
     if topo.rank == 0:
-        base_logits, base_loss = base(x, y)
+        base_logits, base_loss, base_aux = base(x, y)
         diff = (tp_logits - base_logits).abs()
         print(f"forward diff max={diff.max().item():.6f} mean={diff.mean().item():.6f}")
         print(f"loss diff={abs(tp_loss.item()-base_loss.item()):.6f}")
 
     # backward (selected grads)
     tp_model.zero_grad(set_to_none=True)
-    tp_loss.backward()
+    (tp_loss + tp_aux).backward()
     if topo.rank == 0:
         base.zero_grad(set_to_none=True)
-        base_loss.backward()
+        (base_loss + base_aux).backward()
 
     # compare column-parallel grad (c_attn.weight)
     tp_grad = tp_model.tr.h[0].attn.c_attn.weight.grad

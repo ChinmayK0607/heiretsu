@@ -1,6 +1,7 @@
 """Pipeline parallelism (GPipe-style) with microbatching.
 
 Implements a simple fill/drain schedule with explicit send/recv across PP stages.
+Supports MoE blocks that return (hidden, aux_loss) tuples.
 """
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 
-from gpt_model import GPTConfig, BlockTP
+from gpt_model import GPTConfig, make_block
 from topo import rank_from_coords
 
 
@@ -33,7 +34,10 @@ def _partition_layers(n_layer: int, pp: int) -> List[Tuple[int, int]]:
 
 
 class StageModule(nn.Module):
-    """Local slice of GPT blocks for one PP stage."""
+    """Local slice of GPT blocks for one PP stage.
+    
+    Supports MoE blocks - forward_blocks returns (hidden, aux_loss).
+    """
 
     def __init__(self, cfg: GPTConfig, topo, stage_idx: int, num_stages: int):
         super().__init__()
@@ -45,12 +49,28 @@ class StageModule(nn.Module):
         self.tp = topo.tp
         self.tp_rank = topo.tp_rank
         self.tp_group = topo.tp_group
+        # EP support
+        self.ep = getattr(topo, "ep", 1)
+        self.ep_rank = getattr(topo, "ep_rank", 0)
+        self.ep_group = getattr(topo, "ep_group", None)
 
         ranges = _partition_layers(cfg.n_layer, num_stages)
         self.block_start, self.block_end = ranges[stage_idx]
-        self.blocks = nn.ModuleList(
-            [BlockTP(cfg, tp_group=self.tp_group, tp_rank=self.tp_rank, tp_world_size=self.tp) for _ in range(self.block_start, self.block_end)]
-        )
+        
+        # Use make_block factory to create dense or MoE blocks
+        self.blocks = nn.ModuleList([
+            make_block(
+                cfg, 
+                layer_idx=i,
+                tp_group=self.tp_group, 
+                tp_rank=self.tp_rank, 
+                tp_world_size=self.tp,
+                ep_group=self.ep_group,
+                ep_rank=self.ep_rank,
+                ep_world_size=self.ep,
+            ) 
+            for i in range(self.block_start, self.block_end)
+        ])
 
         if self.is_first:
             self.wte = nn.Embedding(cfg.vocab_size, cfg.n_embed)
@@ -101,10 +121,18 @@ class StageModule(nn.Module):
         x = tok + pos_emb
         return x
 
-    def forward_blocks(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_blocks(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run through local blocks, accumulating aux_loss from MoE blocks.
+        
+        Returns:
+            x: hidden states after all local blocks
+            aux_loss: accumulated auxiliary loss from MoE blocks (0 if all dense)
+        """
+        aux_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         for blk in self.blocks:
-            x = blk(x)
-        return x
+            x, block_aux = blk(x)
+            aux_loss = aux_loss + block_aux
+        return x, aux_loss
 
     def forward_head(self, x: torch.Tensor, targets: Optional[torch.Tensor]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x = self.ln_f(x)
@@ -120,6 +148,7 @@ class PipelineState:
     boundaries: List[torch.Tensor]
     recv_inputs: List[torch.Tensor]
     losses: List[torch.Tensor]
+    aux_losses: List[torch.Tensor]  # MoE auxiliary losses per microbatch
 
 
 class GPipeEngine:
@@ -131,15 +160,19 @@ class GPipeEngine:
         self.dp_rank = topo.dp_rank
         self.tp_rank = topo.tp_rank
         self.tp = topo.tp
+        # EP support
+        self.ep_rank = getattr(topo, "ep_rank", 0)
+        self.ep = getattr(topo, "ep", 1)
         self.is_first = stage.is_first
         self.is_last = stage.is_last
         self.prev_rank = None
         self.next_rank = None
         if self.pp_size > 1:
+            # Updated rank_from_coords with EP dimension
             if self.pp_rank > 0:
-                self.prev_rank = rank_from_coords(self.dp_rank, self.pp_rank - 1, self.tp_rank, topo.dp, topo.tp, topo.pp)
+                self.prev_rank = rank_from_coords(self.dp_rank, self.ep_rank, self.pp_rank - 1, self.tp_rank, topo.dp, topo.ep, topo.tp, topo.pp)
             if self.pp_rank < self.pp_size - 1:
-                self.next_rank = rank_from_coords(self.dp_rank, self.pp_rank + 1, self.tp_rank, topo.dp, topo.tp, topo.pp)
+                self.next_rank = rank_from_coords(self.dp_rank, self.ep_rank, self.pp_rank + 1, self.tp_rank, topo.dp, topo.ep, topo.tp, topo.pp)
 
     def _p2p(self, send_tensor: Optional[torch.Tensor], recv_tensor: Optional[torch.Tensor], peer: Optional[int], tag: int) -> None:
         if peer is None or self.pp_size == 1:
@@ -171,8 +204,14 @@ class GPipeEngine:
         amp_dtype: torch.dtype,
         scaler: Optional[torch.cuda.amp.GradScaler],
         batch_size: int,
-    ) -> Optional[torch.Tensor]:
-        state = PipelineState(boundaries=[], recv_inputs=[], losses=[])
+        aux_loss_coef: float = 0.01,
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+        """Forward-backward pass with aux_loss handling.
+        
+        Returns:
+            (data_loss, aux_loss) - data_loss is only on last stage, aux_loss accumulated from all stages
+        """
+        state = PipelineState(boundaries=[], recv_inputs=[], losses=[], aux_losses=[])
         B = batch_size
         S = self.stage.cfg.block_size
         H = self.stage.cfg.n_embed
@@ -196,7 +235,8 @@ class GPipeEngine:
                     x = self.stage.embed(idx)
                 else:
                     x = recv_x
-                x = self.stage.forward_blocks(x)
+                # forward_blocks now returns (x, aux_loss)
+                x, aux_loss = self.stage.forward_blocks(x)
                 if self.is_last:
                     logits, loss = self.stage.forward_head(x, targets)
                 else:
@@ -211,13 +251,20 @@ class GPipeEngine:
                 state.recv_inputs.append(recv_x)
             if self.is_last and loss is not None:
                 state.losses.append(loss)
+            # Accumulate aux_loss from this stage's MoE blocks
+            state.aux_losses.append(aux_loss)
+
+        # For logging: detached aux summed over microbatches (per stage)
+        total_aux_loss = torch.stack([a.detach() for a in state.aux_losses]).sum() if state.aux_losses else torch.tensor(0.0, device=device)
+        if self.pp_size > 1 and dist.is_initialized() and self.topo.pp_group is not None:
+            dist.all_reduce(total_aux_loss, op=dist.ReduceOp.SUM, group=self.topo.pp_group)
 
         # backward
         for m in reversed(range(micro_batches)):
             if self.is_last:
                 loss = state.losses[m]
-                # scale loss for microbatching
-                loss_mb = loss / micro_batches
+                aux = state.aux_losses[m]
+                loss_mb = (loss + aux) / micro_batches
                 if scaler is not None and scaler.is_enabled():
                     scaler.scale(loss_mb).backward()
                 else:
@@ -231,6 +278,9 @@ class GPipeEngine:
                 grad_boundary = torch.empty_like(boundary)
                 # grad_boundary  # (B_micro,S,H) recv from next PP
                 self._p2p(None, grad_boundary, self.next_rank, self._bwd_tag(m))
+                aux = state.aux_losses[m]
+                if aux.requires_grad:
+                    (aux / micro_batches).backward(retain_graph=True)
                 boundary.backward(grad_boundary)
                 if not self.is_first:
                     grad_in = state.recv_inputs[m].grad
@@ -239,8 +289,8 @@ class GPipeEngine:
         if self.is_last and state.losses:
             with torch.no_grad():
                 loss_total = torch.stack([l.detach() for l in state.losses]).mean()
-            return loss_total
-        return None
+            return loss_total, total_aux_loss.detach()
+        return None, total_aux_loss.detach()
 
     @torch.no_grad()
     def forward_only(
@@ -273,7 +323,7 @@ class GPipeEngine:
                     x = self.stage.embed(idx)
                 else:
                     x = recv_x
-                x = self.stage.forward_blocks(x)
+                x, _ = self.stage.forward_blocks(x)
                 if self.is_last:
                     _, loss = self.stage.forward_head(x, targets)
                 else:

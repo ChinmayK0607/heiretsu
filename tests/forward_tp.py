@@ -52,7 +52,7 @@ else:
 dist.broadcast(x_bcast, src=0)
 
 with torch.no_grad():
-    logits, _ = model(x_bcast)
+    logits, _, _ = model(x_bcast)
 
 # check TP parity (all ranks vs rank0)
 logits_ref = logits.detach().clone()

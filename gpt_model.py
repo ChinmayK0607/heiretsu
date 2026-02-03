@@ -10,8 +10,11 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 from tp_linear import ColumnParallelLinear, ColumnParallelLinearQKV, RowParallelLinear
+from moe import MoELayer, MoEConfig, make_moe_config
 
 from einops import rearrange
+
+
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -19,9 +22,12 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embed: int = 768
-    dropout: float = 0.0 
-
-    # DATA_DIR=/home/t-ckarkar/heiretsu/heiretsu/data/fineweb10B bash compare_tp.sh
+    dropout: float = 0.0
+    # MoE config
+    num_experts: int = 0       # 0 = dense model (no MoE)
+    top_k: int = 2             # experts per token
+    moe_freq: int = 2          # MoE every N layers (0 = all dense)
+    aux_loss_coef: float = 0.01  # load balancing loss coefficient
 
 
 class AttentionTP(nn.Module):
@@ -107,10 +113,97 @@ class BlockTP(nn.Module):
         self.ln_2 = nn.LayerNorm(cfg.n_embed)
         self.mlp = MLPTP(cfg, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp_world_size)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns (hidden, aux_loss) for consistency with BlockMoE. aux_loss=0 for dense blocks."""
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
-        return x
+        # Dense blocks return zero aux_loss
+        aux_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        return x, aux_loss
+
+
+class BlockMoE(nn.Module):
+    """Transformer block with MoE instead of dense MLP."""
+    
+    def __init__(
+        self, 
+        cfg: GPTConfig, 
+        tp_group=None, 
+        tp_rank: int = 0, 
+        tp_world_size: int = 1,
+        ep_group=None,
+        ep_rank: int = 0,
+        ep_world_size: int = 1,
+    ):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(cfg.n_embed)
+        self.attn = AttentionTP(cfg, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp_world_size)
+        self.ln_2 = nn.LayerNorm(cfg.n_embed)
+        
+        # MoE layer replaces MLPTP
+        moe_config = make_moe_config(
+            hidden_size=cfg.n_embed,
+            num_experts=cfg.num_experts,
+            top_k=cfg.top_k,
+            intermediate_mult=4,
+            aux_loss_coef=cfg.aux_loss_coef,
+        )
+        self.moe = MoELayer(
+            config=moe_config,
+            ep_group=ep_group,
+            ep_rank=ep_rank,
+            ep_world_size=ep_world_size,
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns (hidden, aux_loss)."""
+        x = x + self.attn(self.ln_1(x))
+        moe_out, aux_loss = self.moe(self.ln_2(x))
+        x = x + moe_out
+        return x, aux_loss
+
+
+def make_block(
+    cfg: GPTConfig,
+    layer_idx: int,
+    tp_group=None,
+    tp_rank: int = 0,
+    tp_world_size: int = 1,
+    ep_group=None,
+    ep_rank: int = 0,
+    ep_world_size: int = 1,
+) -> nn.Module:
+    """Factory to create either BlockTP (dense) or BlockMoE based on config.
+    
+    MoE blocks are created for layers where (layer_idx + 1) % moe_freq == 0,
+    if num_experts > 0 and moe_freq > 0.
+    
+    Returns:
+        Block that returns (hidden, aux_loss) tuple.
+    """
+    use_moe = (
+        cfg.num_experts > 0 
+        and cfg.moe_freq > 0 
+        and (layer_idx + 1) % cfg.moe_freq == 0
+    )
+    
+    if use_moe:
+        return BlockMoE(
+            cfg, 
+            tp_group=tp_group, 
+            tp_rank=tp_rank, 
+            tp_world_size=tp_world_size,
+            ep_group=ep_group,
+            ep_rank=ep_rank,
+            ep_world_size=ep_world_size,
+        )
+    else:
+        return BlockTP(
+            cfg, 
+            tp_group=tp_group, 
+            tp_rank=tp_rank, 
+            tp_world_size=tp_world_size,
+        )
 
 
 class GPT(nn.Module):
@@ -120,12 +213,27 @@ class GPT(nn.Module):
         tp = getattr(topo, "tp", 1) if topo is not None else 1
         tp_rank = getattr(topo, "tp_rank", 0) if topo is not None else 0
         tp_group = getattr(topo, "tp_group", None) if topo is not None else None
+        ep = getattr(topo, "ep", 1) if topo is not None else 1
+        ep_rank = getattr(topo, "ep_rank", 0) if topo is not None else 0
+        ep_group = getattr(topo, "ep_group", None) if topo is not None else None
 
         self.tr = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(cfg.vocab_size, cfg.n_embed),
                 wpe=nn.Embedding(cfg.block_size, cfg.n_embed),
-                h=nn.ModuleList([BlockTP(cfg, tp_group=tp_group, tp_rank=tp_rank, tp_world_size=tp) for _ in range(cfg.n_layer)]),
+                h=nn.ModuleList([
+                    make_block(
+                        cfg, 
+                        layer_idx=i,
+                        tp_group=tp_group, 
+                        tp_rank=tp_rank, 
+                        tp_world_size=tp,
+                        ep_group=ep_group,
+                        ep_rank=ep_rank,
+                        ep_world_size=ep,
+                    ) 
+                    for i in range(cfg.n_layer)
+                ]),
                 ln_f=nn.LayerNorm(cfg.n_embed),
             )
         )
@@ -135,6 +243,7 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
 
     def _init_weights(self, m: nn.Module) -> None:
+        from moe import Expert
         if isinstance(m, (nn.Linear, ColumnParallelLinear, ColumnParallelLinearQKV, RowParallelLinear)):
             std = 0.02
             if hasattr(m, "NANOGPT_SCALE_INIT"):
@@ -150,17 +259,30 @@ class GPT(nn.Module):
 
     def forward(
         self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        """
+        Forward pass.
+        
+        Returns:
+            logits: [B, T, V]
+            loss: Optional cross-entropy loss
+            aux_loss: Accumulated MoE auxiliary loss (0 if no MoE blocks)
+        """
         B, T = idx.size()
         if T > self.cfg.block_size:
             raise ValueError(f"Sequence length {T} > block_size {self.cfg.block_size}")
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
         x = self.tr.wte(idx) + self.tr.wpe(pos)[None, :, :]
+        
+        # Accumulate aux_loss from all blocks
+        total_aux_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         for blk in self.tr.h:
-            x = blk(x)
+            x, aux_loss = blk(x)
+            total_aux_loss = total_aux_loss + aux_loss
+        
         x = self.tr.ln_f(x)
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        return logits, loss
+        return logits, loss, total_aux_loss

@@ -29,6 +29,6 @@ model.eval()
 loader = RandomBatchLoader(data_dir, "val", B, T, num_chunks=1, seed=seed, rank=0, dp_rank=0, dp_size=1)
 x, _ = loader.next_batch(torch.device("cpu"))
 with torch.no_grad():
-    logits, _ = model(x)
+    logits, _, _ = model(x)
 np.save(out_path, logits.float().cpu().numpy())
 print(f"saved {out_path} shape {logits.shape}")

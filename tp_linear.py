@@ -141,11 +141,11 @@ class ColumnParallelLinear(nn.Module):
         # x: (B,S,in_features)
         # W_shard = self.weight: (out_features/TP, in_features)
         B, S, in_features = x.shape
-        x2d = einops.rearrange(x, 'b s in -> (b s) in')
+        x2d = einops.rearrange(x, 'b s d -> (b s) d')
         W_shard = self.weight
         b_shard = self.bias
         # local matmul: y_shard_2d = x2d @ W_shard.T  # (B*S, out/TP)
-        y_shard_2d = einops.einsum(x2d, W_shard, 'bs in, op in -> bs op')
+        y_shard_2d = einops.einsum(x2d, W_shard, 'bs d, op d -> bs op')
         # add bias shard
         if b_shard is not None: 
             y_shard_2d = y_shard_2d + b_shard
@@ -220,8 +220,8 @@ class ColumnParallelLinearQKV(nn.Module):
         
         # x: (B,S,in_features) -> y_shard (B,S,3*out_features/TP)
         B, S, _ = x.shape
-        x2d = einops.rearrange(x, "b s in -> (b s) in")
-        y_shard_2d = einops.einsum(x2d, self.weight, "bs in, op in -> bs op")
+        x2d = einops.rearrange(x, "b s d -> (b s) d")
+        y_shard_2d = einops.einsum(x2d, self.weight, "bs d, op d -> bs op")
         if self.bias is not None:
             y_shard_2d = y_shard_2d + self.bias
         y_shard = einops.rearrange(y_shard_2d, "(b s) op -> b s op", b=B, s=S)
@@ -296,9 +296,9 @@ class RowParallelLinear(nn.Module):
         W_shard = self.weight
         
         # flatten: x_shard (B,S,in/TP) -> x2d (B*S, in/TP)
-        x_2d = einops.rearrange(x_shard, 'b s in -> (b s) in')
+        x_2d = einops.rearrange(x_shard, 'b s d -> (b s) d')
         # local matmul: y_partial_2d = x2d @ W_shard.T  # (B*S, out)
-        y_partial_2d = einops.einsum(x_2d, W_shard, 'bs in, op in -> bs op')
+        y_partial_2d = einops.einsum(x_2d, W_shard, 'bs d, op d -> bs op')
         # unflatten: y_partial_2d (B*S, out) -> y_partial (B,S,out)
         y_partial = einops.rearrange(y_partial_2d, '(b s) op -> b s op', b=B, s=S)
         

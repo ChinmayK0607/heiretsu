@@ -204,7 +204,11 @@ def main() -> None:
     if args.backend == "nccl" and not torch.cuda.is_available():
         args.backend = "gloo"
 
-    dist.init_process_group(backend=args.backend)
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if args.backend == "nccl":
+        dist.init_process_group(backend=args.backend, device_id=torch.device("cuda", local_rank))
+    else:
+        dist.init_process_group(backend=args.backend)
     topo = init_topology(dp=args.dp, ep=args.ep, tp=args.tp, pp=args.pp)
 
     # Ensure pipeline partitioning is valid: must have n_layer >= pp
@@ -213,7 +217,6 @@ def main() -> None:
             print(f"[grad_parity] bumping n_layer from {args.n_layer} to {args.pp} to satisfy pp>n_layer constraint")
         args.n_layer = args.pp
 
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
     if device.type == "cuda":
         torch.cuda.set_device(device)

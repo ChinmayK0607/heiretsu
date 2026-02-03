@@ -3,6 +3,10 @@ set -euo pipefail
 
 # Change to the heiretsu project root (parent of tests/)
 cd "$(dirname "$0")/.."
+
+# Suppress NCCL P2P serialization warning (informational, not an error)
+export TORCH_NCCL_SHOW_EAGER_INIT_P2P_SERIALIZATION_WARNING=0
+
 BACKEND=${BACKEND:-nccl}
 THRESH=${THRESH:-1e-4}
 TRAIN_STEPS=${TRAIN_STEPS:-10}

@@ -196,6 +196,9 @@ def main():
     # AMP
     p.add_argument("--amp", type=str, choices=["none", "fp16", "bf16"], default="none")
 
+    # torch.compile
+    p.add_argument("--compile", action="store_true", help="Use torch.compile for faster training")
+
     # device / seed
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
     p.add_argument("--seed", type=int, default=1337)
@@ -290,6 +293,23 @@ def main():
         engine = None
         local_module = model
     
+    # torch.compile
+    if args.compile:
+        if rank == 0:
+            print("[compile] Compiling model with torch.compile...")
+        if use_pipeline:
+            stage = torch.compile(stage)
+            engine = GPipeEngine(stage, topo)
+            local_module = stage
+        else:
+            model = torch.compile(model)
+            local_module = model
+
+    # Log model info
+    n_params = sum(p.numel() for p in local_module.parameters())
+    if rank == 0:
+        print(f"[model] parameters: {n_params:,} ({n_params/1e6:.1f}M)")
+
     # Log MoE info
     if rank == 0 and args.num_experts > 0:
         moe_layers = sum(1 for i in range(args.n_layer) if args.moe_freq > 0 and (i + 1) % args.moe_freq == 0)
@@ -335,6 +355,19 @@ def main():
     amp_dtype = torch.float16 if args.amp == "fp16" else torch.bfloat16
     scaler = torch.amp.GradScaler('cuda',enabled=(args.amp == "fp16"))
     is_main = (topo.dp_rank == 0 and topo.tp_rank == 0 and topo.pp_rank == (topo.pp - 1))
+
+    def collect_expert_counts(module):
+        """Gather per-expert token counts from all MoELayer instances."""
+        from moe import MoELayer
+        total = None
+        for m in module.modules():
+            if isinstance(m, MoELayer) and hasattr(m, '_expert_counts'):
+                c = m._expert_counts.float()
+                if total is None:
+                    total = c.clone()
+                else:
+                    total = total + c
+        return total  # [E] summed over all MoE layers, or None
 
     def log_wandb(payload, step=None):
         if is_main and run is not None:
@@ -444,6 +477,26 @@ def main():
             }
             if args.num_experts > 0:
                 log_dict["train/aux_loss"] = float(aux_loss.item())
+                # Expert load diagnostics
+                expert_counts = collect_expert_counts(local_module)
+                if expert_counts is not None:
+                    E = expert_counts.shape[0]
+                    expert_names = [f"E{i}" for i in range(E)]
+                    # Per-expert fraction (how balanced are they?)
+                    total_tokens = expert_counts.sum().item()
+                    if total_tokens > 0:
+                        fracs = expert_counts / total_tokens
+                        for i in range(E):
+                            log_dict[f"expert_load/expert_{i}"] = float(expert_counts[i].item())
+                            log_dict[f"expert_frac/expert_{i}"] = float(fracs[i].item())
+                        log_dict["expert_load/max_frac"] = float(fracs.max().item())
+                        log_dict["expert_load/min_frac"] = float(fracs.min().item())
+                        log_dict["expert_load/imbalance_ratio"] = float(fracs.max().item() / max(fracs.min().item(), 1e-9))
+                    # wandb bar chart
+                    table = wandb.Table(data=[[n, float(c)] for n, c in zip(expert_names, expert_counts.tolist())],
+                                        columns=["Expert", "Tokens"])
+                    log_dict["expert_load/distribution"] = wandb.plot.bar(
+                        table, "Expert", "Tokens", title=f"Expert Load (step {step})")
             wandb.log(log_dict, step=step)
 
         # periodic eval

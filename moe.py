@@ -324,6 +324,12 @@ class MoELayer(nn.Module):
             self.num_experts, self.top_k, 
             self.aux_loss_coef
         )
+
+        # 3b. Stash per-expert token counts for diagnostics (detached, no grad)
+        with torch.no_grad():
+            self._expert_counts = torch.zeros(self.num_experts, device=x.device)
+            ones = torch.ones_like(top_indices.flatten(), dtype=torch.float32)
+            self._expert_counts.scatter_add_(0, top_indices.flatten(), ones)
         
         # 4. Expand tokens for K selections
         # expanded_x = repeat(x_flat, 'n h -> (n k) h', k=K)  # (N*K, H)

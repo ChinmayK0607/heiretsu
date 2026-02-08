@@ -258,10 +258,14 @@ def main():
     rank = topo.rank
     world_size = topo.world_size
 
-    # model init must be identical across DP ranks -> seed with base seed only
-    torch.manual_seed(args.seed)
+    # Model init seed: must be identical across DP ranks but different across TP ranks.
+    # - DP ranks need same init so gradient averaging is correct
+    # - TP ranks need different init to ensure diversity in sharded weights
+    # - PP ranks can share seed (they have non-overlapping layers)
+    model_init_seed = args.seed + topo.tp_rank
+    torch.manual_seed(model_init_seed)
     if device.type == "cuda":
-        torch.cuda.manual_seed_all(args.seed)
+        torch.cuda.manual_seed_all(model_init_seed)
 
     # model / stage init (with MoE config)
     cfg = GPTConfig(

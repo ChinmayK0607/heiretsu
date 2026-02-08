@@ -20,7 +20,7 @@ import torch.distributed as dist
 
 from gpt_model import GPT, GPTConfig
 from tp_linear import ColumnParallelLinear, ColumnParallelLinearQKV, RowParallelLinear
-from pipeline import StageModule
+from pipeline import StageModule, GPipeEngine
 from topo import init_topology, cleanup, rank_from_coords
 from dp import average_gradients
 
@@ -69,7 +69,82 @@ def _slice_qkv(full_w: torch.Tensor, tp_rank: int, tp: int) -> torch.Tensor:
     return torch.cat(shards, dim=0)
 
 
-def load_stage_from_full_state(stage: StageModule, full_state: dict, tp_rank: int, tp: int) -> None:
+def _is_moe_block(blk) -> bool:
+    """Check if a block is MoE (has 'moe' attr) vs dense (has 'mlp' attr)."""
+    return hasattr(blk, "moe")
+
+
+def _load_moe_weights(blk, full_state: dict, prefix: str, ep_rank: int = 0) -> None:
+    """Load MoE layer weights (router + experts) with EP sharding.
+    
+    Each EP rank only has local experts. We need to map:
+    - local_expert_idx -> global_expert_idx = ep_rank * num_local_experts + local_expert_idx
+    """
+    # Router gate (replicated across EP ranks)
+    blk.moe.router.gate.weight.data.copy_(full_state[prefix + "moe.router.gate.weight"])
+    # Experts (via expert_group) - load only local experts
+    num_local_experts = len(blk.moe.expert_group.experts)
+    expert_start = ep_rank * num_local_experts
+    for local_idx, expert in enumerate(blk.moe.expert_group.experts):
+        global_idx = expert_start + local_idx
+        expert.w1.weight.data.copy_(full_state[f"{prefix}moe.expert_group.experts.{global_idx}.w1.weight"])
+        expert.w2.weight.data.copy_(full_state[f"{prefix}moe.expert_group.experts.{global_idx}.w2.weight"])
+
+
+def _load_dense_mlp_weights(blk, full_state: dict, prefix: str, tp_rank: int, tp: int) -> None:
+    """Load dense MLP weights with TP slicing."""
+    full_fc1_w = full_state[prefix + "mlp.c_fc.weight"]
+    full_fc1_b = full_state[prefix + "mlp.c_fc.bias"]
+    blk.mlp.c_fc.weight.data.copy_(_slice_col(full_fc1_w, tp_rank, tp))
+    blk.mlp.c_fc.bias.data.copy_(_slice_col(full_fc1_b.unsqueeze(1), tp_rank, tp).squeeze(1))
+
+    full_fc2_w = full_state[prefix + "mlp.c_proj.weight"]
+    full_fc2_b = full_state[prefix + "mlp.c_proj.bias"]
+    blk.mlp.c_proj.weight.data.copy_(_slice_row(full_fc2_w, tp_rank, tp))
+    blk.mlp.c_proj.bias.data.copy_(full_fc2_b)
+
+
+def load_gpt_from_full_state(model: GPT, full_state: dict, tp_rank: int, tp: int, ep_rank: int = 0) -> None:
+    # Check if model has MoE layers (which require special EP handling)
+    has_moe = any(_is_moe_block(blk) for blk in model.tr.h)
+    if tp == 1 and not has_moe:
+        model.load_state_dict(full_state)
+        return
+    # embeddings/head
+    model.tr.wte.weight.data.copy_(full_state["tr.wte.weight"])
+    model.tr.wpe.weight.data.copy_(full_state["tr.wpe.weight"])
+    model.tr.ln_f.weight.data.copy_(full_state["tr.ln_f.weight"])
+    model.tr.ln_f.bias.data.copy_(full_state["tr.ln_f.bias"])
+    model.lm_head.weight.data.copy_(full_state["lm_head.weight"])
+
+    # blocks
+    for i, blk in enumerate(model.tr.h):
+        prefix = f"tr.h.{i}."
+        blk.ln_1.weight.data.copy_(full_state[prefix + "ln_1.weight"])
+        blk.ln_1.bias.data.copy_(full_state[prefix + "ln_1.bias"])
+        blk.ln_2.weight.data.copy_(full_state[prefix + "ln_2.weight"])
+        blk.ln_2.bias.data.copy_(full_state[prefix + "ln_2.bias"])
+
+        # attention qkv
+        full_qkv_w = full_state[prefix + "attn.c_attn.weight"]
+        full_qkv_b = full_state[prefix + "attn.c_attn.bias"]
+        blk.attn.c_attn.weight.data.copy_(_slice_qkv(full_qkv_w, tp_rank, tp))
+        blk.attn.c_attn.bias.data.copy_(_slice_qkv(full_qkv_b.unsqueeze(1), tp_rank, tp).squeeze(1))
+
+        # attention out proj
+        full_o_w = full_state[prefix + "attn.c_proj.weight"]
+        full_o_b = full_state[prefix + "attn.c_proj.bias"]
+        blk.attn.c_proj.weight.data.copy_(_slice_row(full_o_w, tp_rank, tp))
+        blk.attn.c_proj.bias.data.copy_(full_o_b)
+
+        # MoE vs dense MLP
+        if _is_moe_block(blk):
+            _load_moe_weights(blk, full_state, prefix, ep_rank)
+        else:
+            _load_dense_mlp_weights(blk, full_state, prefix, tp_rank, tp)
+
+
+def load_stage_from_full_state(stage: StageModule, full_state: dict, tp_rank: int, tp: int, ep_rank: int = 0) -> None:
     # embeddings/head
     if stage.is_first:
         stage.wte.weight.data.copy_(full_state["tr.wte.weight"])
@@ -101,28 +176,30 @@ def load_stage_from_full_state(stage: StageModule, full_state: dict, tp_rank: in
         blk.attn.c_proj.weight.data.copy_(_slice_row(full_o_w, tp_rank, tp))
         blk.attn.c_proj.bias.data.copy_(full_o_b)
 
-        # mlp fc1 (col-parallel)
-        full_fc1_w = full_state[prefix + "mlp.c_fc.weight"]
-        full_fc1_b = full_state[prefix + "mlp.c_fc.bias"]
-        blk.mlp.c_fc.weight.data.copy_(_slice_col(full_fc1_w, tp_rank, tp))
-        blk.mlp.c_fc.bias.data.copy_(_slice_col(full_fc1_b.unsqueeze(1), tp_rank, tp).squeeze(1))
-
-        # mlp fc2 (row-parallel)
-        full_fc2_w = full_state[prefix + "mlp.c_proj.weight"]
-        full_fc2_b = full_state[prefix + "mlp.c_proj.bias"]
-        blk.mlp.c_proj.weight.data.copy_(_slice_row(full_fc2_w, tp_rank, tp))
-        blk.mlp.c_proj.bias.data.copy_(full_fc2_b)
+        # MoE vs dense MLP
+        if _is_moe_block(blk):
+            _load_moe_weights(blk, full_state, prefix, ep_rank)
+        else:
+            _load_dense_mlp_weights(blk, full_state, prefix, tp_rank, tp)
 
 
-def pp_forward_logits(stage: StageModule, topo, x: torch.Tensor, y: torch.Tensor) -> Optional[torch.Tensor]:
-    """Run a single microbatch forward through PP stages and return logits on last stage."""
+def pp_forward_logits(stage: StageModule, topo, x: torch.Tensor, y: torch.Tensor, cfg: GPTConfig) -> Optional[torch.Tensor]:
+    """Run a single microbatch forward through PP stages and return logits on last stage.
+    
+    For MoE+PP: EP ranks must sync before forward_blocks since MoE uses all-to-all.
+    """
     device = x.device
     B, T = x.shape
     H = stage.cfg.n_embed
+    
+    has_moe = cfg.num_experts > 0 and cfg.moe_freq > 0
 
     if stage.is_first:
         with torch.no_grad():
             h = stage.embed(x)
+            # Sync EP ranks before MoE forward all-to-all
+            if has_moe and topo.ep_group is not None:
+                dist.barrier(group=topo.ep_group)
             h, _ = stage.forward_blocks(h)
         if topo.pp_rank < topo.pp - 1:
             dist.send(h, dst=rank_from_coords(topo.dp_rank, topo.ep_rank, topo.pp_rank + 1, topo.tp_rank, topo.dp, topo.ep, topo.tp, topo.pp), tag=1000)
@@ -132,6 +209,9 @@ def pp_forward_logits(stage: StageModule, topo, x: torch.Tensor, y: torch.Tensor
         h = torch.empty((B, T, H), device=device)
         dist.recv(h, src=rank_from_coords(topo.dp_rank, topo.ep_rank, topo.pp_rank - 1, topo.tp_rank, topo.dp, topo.ep, topo.tp, topo.pp), tag=1000)
         with torch.no_grad():
+            # Sync EP ranks before MoE forward all-to-all
+            if has_moe and topo.ep_group is not None:
+                dist.barrier(group=topo.ep_group)
             h, _ = stage.forward_blocks(h)
             logits, _ = stage.forward_head(h, y)
         return logits
@@ -140,9 +220,25 @@ def pp_forward_logits(stage: StageModule, topo, x: torch.Tensor, y: torch.Tensor
     h = torch.empty((B, T, H), device=device)
     dist.recv(h, src=rank_from_coords(topo.dp_rank, topo.ep_rank, topo.pp_rank - 1, topo.tp_rank, topo.dp, topo.ep, topo.tp, topo.pp), tag=1000)
     with torch.no_grad():
+        # Sync EP ranks before MoE forward all-to-all
+        if has_moe and topo.ep_group is not None:
+            dist.barrier(group=topo.ep_group)
         h, _ = stage.forward_blocks(h)
     dist.send(h, dst=rank_from_coords(topo.dp_rank, topo.ep_rank, topo.pp_rank + 1, topo.tp_rank, topo.dp, topo.ep, topo.tp, topo.pp), tag=1000)
     return None
+
+
+class _LoaderAdapter:
+    def __init__(self, x: torch.Tensor, y: torch.Tensor):
+        self.x = x
+        self.y = y
+        self.used = False
+
+    def next_batch(self, device: torch.device):
+        if self.used:
+            return self.x.to(device), self.y.to(device)
+        self.used = True
+        return self.x.to(device), self.y.to(device)
 
 
 def main():
@@ -226,12 +322,12 @@ def main():
     # forward path under target topology
     if topo.pp > 1:
         stage = StageModule(cfg, topo, topo.pp_rank, topo.pp).to(device)
-        load_stage_from_full_state(stage, ref_state, topo.tp_rank, topo.tp)
+        load_stage_from_full_state(stage, ref_state, topo.tp_rank, topo.tp, topo.ep_rank)
         stage.eval()
-        logits = pp_forward_logits(stage, topo, x, y)
-        # Only the last stage in dp_rank=0 sends logits to rank0 for comparison.
-        # Other DP replicas skip the send/recv to avoid hangs.
-        if stage.is_last and topo.dp_rank == 0 and topo.tp_rank == 0:
+        logits = pp_forward_logits(stage, topo, x, y, cfg)
+        # Only the last stage in dp_rank=0, ep_rank=0 sends logits to rank0 for comparison.
+        # Other DP/EP replicas skip the send/recv to avoid hangs.
+        if stage.is_last and topo.dp_rank == 0 and topo.ep_rank == 0 and topo.tp_rank == 0:
             # send logits to rank0 for comparison
             dist.send(logits, dst=0, tag=2000)
         if topo.rank == 0:
@@ -244,6 +340,7 @@ def main():
         dist.barrier()
     else:
         model = GPT(cfg, topo=topo).to(device)
+        load_gpt_from_full_state(model, ref_state, topo.tp_rank, topo.tp, topo.ep_rank)
         model.eval()
         with torch.no_grad():
             logits, loss, _ = model(x, y)
@@ -261,55 +358,18 @@ def main():
     # backward sanity (single step)
     if topo.pp > 1:
         stage = StageModule(cfg, topo, topo.pp_rank, topo.pp).to(device)
+        engine = GPipeEngine(stage, topo)
         stage.train()
 
-        prev_rank = rank_from_coords(topo.dp_rank, topo.ep_rank, topo.pp_rank - 1, topo.tp_rank, topo.dp, topo.ep, topo.tp, topo.pp) if not stage.is_first else None
-        next_rank = rank_from_coords(topo.dp_rank, topo.ep_rank, topo.pp_rank + 1, topo.tp_rank, topo.dp, topo.ep, topo.tp, topo.pp) if not stage.is_last else None
-
-        B, T, H = args.batch_size, args.block_size, cfg.n_embed
-
-        if stage.is_first:
-            # first stage: forward embeddings/blocks, send activations, receive grad from next stage
-            h = stage.embed(x)
-            h, aux = stage.forward_blocks(h)
-            if aux.requires_grad:
-                aux.backward(retain_graph=True)
-            h.requires_grad_(True)
-            dist.send(h, dst=next_rank, tag=3000)
-
-            grad_out = torch.empty_like(h)
-            dist.recv(grad_out, src=next_rank, tag=3001)
-            h.backward(grad_out)
-
-        elif stage.is_last:
-            # last stage: receive activations, run head, backprop, send grad of input to prev stage
-            h_in = torch.empty((B, T, H), device=device)
-            dist.recv(h_in, src=prev_rank, tag=3000)
-            h_in.requires_grad_(True)
-
-            h_out, aux = stage.forward_blocks(h_in)
-            logits, loss = stage.forward_head(h_out, y)
-            total_loss = loss + aux
-            total_loss.backward()
-
-            dist.send(h_in.grad, dst=prev_rank, tag=3001)
-
-        else:
-            # middle stage: receive activations, forward blocks, send to next, receive grad, backprop, send grad to prev
-            h_in = torch.empty((B, T, H), device=device)
-            dist.recv(h_in, src=prev_rank, tag=3000)
-            h_in.requires_grad_(True)
-
-            h_out, aux = stage.forward_blocks(h_in)
-            dist.send(h_out, dst=next_rank, tag=3000)
-
-            grad_out = torch.empty_like(h_out)
-            dist.recv(grad_out, src=next_rank, tag=3001)
-
-            if aux.requires_grad:
-                aux.backward(retain_graph=True)
-            h_out.backward(grad_out)
-            dist.send(h_in.grad, dst=prev_rank, tag=3001)
+        loss, _ = engine.forward_backward(
+            loader=_LoaderAdapter(x, y),
+            micro_batches=1,
+            device=device,
+            use_amp=False,
+            amp_dtype=torch.float32,
+            scaler=None,
+            batch_size=args.batch_size,
+        )
 
         # Average gradients across DP replicas if dp > 1
         average_gradients(stage, topo.dp_group)

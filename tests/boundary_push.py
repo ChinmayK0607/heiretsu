@@ -145,7 +145,7 @@ def main():
             # Determine the rank of the canonical last stage (dp_rank=0, tp_rank=0, pp_rank=pp-1)
             from topo import rank_from_coords
             last_stage_rank = rank_from_coords(0, 0, topo.pp - 1, 0, topo.dp, topo.ep, topo.tp, topo.pp)
-            if engine.is_last and topo.dp_rank == 0 and topo.tp_rank == 0 and topo.rank != 0:
+            if engine.is_last and topo.dp_rank == 0 and topo.ep_rank == 0 and topo.tp_rank == 0 and topo.rank != 0:
                 # Last stage sends loss to rank 0
                 dist.send(loss_scalar.unsqueeze(0), dst=0, tag=4000 + step)
             elif topo.rank == 0:

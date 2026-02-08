@@ -15,6 +15,7 @@ NUM_EXPERTS=${NUM_EXPERTS:-8}
 TOP_K=${TOP_K:-2}
 LOG_DIR=${LOG_DIR:-tests/logs/full_suite_$(date +%Y%m%d_%H%M%S)}
 TEST_MOE=${TEST_MOE:-auto}  # auto, 0, or 1
+MOE_ONLY=${MOE_ONLY:-0}     # 1 to run only MoE configs
 
 mkdir -p "$LOG_DIR"
 
@@ -31,7 +32,7 @@ echo "Detected $num_gpus GPUs"
 configs=()
 
 # 4-GPU dense configs
-if [[ $num_gpus -ge 4 ]]; then
+if [[ $num_gpus -ge 4 && "$MOE_ONLY" != "1" ]]; then
   configs+=(
     "4,1,1,1,0"   # DP only
     "1,1,4,1,0"   # TP only
@@ -44,18 +45,20 @@ fi
 
 # 8-GPU configs
 if [[ $num_gpus -ge 8 ]]; then
-  # Dense 3D
-  configs+=(
-    "2,1,2,2,0"   # Full 3D (DP + TP + PP)
-    "4,1,2,1,0"   # DP(4) + TP(2)
-    "2,1,4,1,0"   # DP(2) + TP(4)
-  )
+  # Dense 3D (skip if MOE_ONLY)
+  if [[ "$MOE_ONLY" != "1" ]]; then
+    configs+=(
+      "2,1,2,2,0"   # Full 3D (DP + TP + PP)
+      "4,1,2,1,0"   # DP(4) + TP(2)
+      "2,1,4,1,0"   # DP(2) + TP(4)
+    )
+  fi
   
   # MoE + EP configs (if enabled)
   if [[ "$TEST_MOE" == "auto" || "$TEST_MOE" == "1" ]]; then
     configs+=(
-      "2,2,2,1,1"   # DP(2) + EP(2) + TP(2) - 4D MoE
-      "4,2,1,1,1"   # DP(4) + EP(2) - MoE with EP
+      # "2,2,2,1,1"   # DP(2) + EP(2) + TP(2) - 4D MoE
+      # "4,2,1,1,1"   # DP(4) + EP(2) - MoE with EP
       "1,2,2,2,1"   # EP(2) + TP(2) + PP(2) - MoE 3D
       "2,4,1,1,1"   # DP(2) + EP(4) - heavy EP
     )

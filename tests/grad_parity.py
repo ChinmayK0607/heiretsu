@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.distributed as dist
 
 from gpt_model import GPT, GPTConfig
@@ -98,8 +99,45 @@ def _slice_qkv(full_w: torch.Tensor, tp_rank: int, tp: int) -> torch.Tensor:
     return torch.cat(shards, dim=0)
 
 
-def load_gpt_from_full_state(model: GPT, full_state: dict, tp_rank: int, tp: int) -> None:
-    if tp == 1:
+def _is_moe_block(blk: nn.Module) -> bool:
+    """Check if a block is MoE (has 'moe' attr) vs dense (has 'mlp' attr)."""
+    return hasattr(blk, "moe")
+
+
+def _load_moe_weights(blk: nn.Module, full_state: dict, prefix: str, ep_rank: int = 0) -> None:
+    """Load MoE layer weights (router + experts) with EP sharding.
+    
+    Each EP rank only has local experts. We need to map:
+    - local_expert_idx -> global_expert_idx = ep_rank * num_local_experts + local_expert_idx
+    """
+    # Router gate (replicated across EP ranks)
+    blk.moe.router.gate.weight.data.copy_(full_state[prefix + "moe.router.gate.weight"])
+    # Experts (via expert_group) - load only local experts
+    num_local_experts = len(blk.moe.expert_group.experts)
+    expert_start = ep_rank * num_local_experts
+    for local_idx, expert in enumerate(blk.moe.expert_group.experts):
+        global_idx = expert_start + local_idx
+        expert.w1.weight.data.copy_(full_state[f"{prefix}moe.expert_group.experts.{global_idx}.w1.weight"])
+        expert.w2.weight.data.copy_(full_state[f"{prefix}moe.expert_group.experts.{global_idx}.w2.weight"])
+
+
+def _load_dense_mlp_weights(blk: nn.Module, full_state: dict, prefix: str, tp_rank: int, tp: int) -> None:
+    """Load dense MLP weights with TP slicing."""
+    full_fc1_w = full_state[prefix + "mlp.c_fc.weight"]
+    full_fc1_b = full_state[prefix + "mlp.c_fc.bias"]
+    blk.mlp.c_fc.weight.data.copy_(_slice_col(full_fc1_w, tp_rank, tp))
+    blk.mlp.c_fc.bias.data.copy_(_slice_col(full_fc1_b.unsqueeze(1), tp_rank, tp).squeeze(1))
+
+    full_fc2_w = full_state[prefix + "mlp.c_proj.weight"]
+    full_fc2_b = full_state[prefix + "mlp.c_proj.bias"]
+    blk.mlp.c_proj.weight.data.copy_(_slice_row(full_fc2_w, tp_rank, tp))
+    blk.mlp.c_proj.bias.data.copy_(full_fc2_b)
+
+
+def load_gpt_from_full_state(model: GPT, full_state: dict, tp_rank: int, tp: int, ep_rank: int = 0) -> None:
+    # Check if model has MoE layers (which require special EP handling)
+    has_moe = any(_is_moe_block(blk) for blk in model.tr.h)
+    if tp == 1 and not has_moe:
         model.load_state_dict(full_state)
         return
     # embeddings/head
@@ -129,20 +167,14 @@ def load_gpt_from_full_state(model: GPT, full_state: dict, tp_rank: int, tp: int
         blk.attn.c_proj.weight.data.copy_(_slice_row(full_o_w, tp_rank, tp))
         blk.attn.c_proj.bias.data.copy_(full_o_b)
 
-        # mlp fc1
-        full_fc1_w = full_state[prefix + "mlp.c_fc.weight"]
-        full_fc1_b = full_state[prefix + "mlp.c_fc.bias"]
-        blk.mlp.c_fc.weight.data.copy_(_slice_col(full_fc1_w, tp_rank, tp))
-        blk.mlp.c_fc.bias.data.copy_(_slice_col(full_fc1_b.unsqueeze(1), tp_rank, tp).squeeze(1))
-
-        # mlp fc2
-        full_fc2_w = full_state[prefix + "mlp.c_proj.weight"]
-        full_fc2_b = full_state[prefix + "mlp.c_proj.bias"]
-        blk.mlp.c_proj.weight.data.copy_(_slice_row(full_fc2_w, tp_rank, tp))
-        blk.mlp.c_proj.bias.data.copy_(full_fc2_b)
+        # MoE vs dense MLP
+        if _is_moe_block(blk):
+            _load_moe_weights(blk, full_state, prefix, ep_rank)
+        else:
+            _load_dense_mlp_weights(blk, full_state, prefix, tp_rank, tp)
 
 
-def load_stage_from_full_state(stage: StageModule, full_state: dict, tp_rank: int, tp: int) -> None:
+def load_stage_from_full_state(stage: StageModule, full_state: dict, tp_rank: int, tp: int, ep_rank: int = 0) -> None:
     if stage.is_first:
         stage.wte.weight.data.copy_(full_state["tr.wte.weight"])
         stage.wpe.weight.data.copy_(full_state["tr.wpe.weight"])
@@ -169,15 +201,11 @@ def load_stage_from_full_state(stage: StageModule, full_state: dict, tp_rank: in
         blk.attn.c_proj.weight.data.copy_(_slice_row(full_o_w, tp_rank, tp))
         blk.attn.c_proj.bias.data.copy_(full_o_b)
 
-        full_fc1_w = full_state[prefix + "mlp.c_fc.weight"]
-        full_fc1_b = full_state[prefix + "mlp.c_fc.bias"]
-        blk.mlp.c_fc.weight.data.copy_(_slice_col(full_fc1_w, tp_rank, tp))
-        blk.mlp.c_fc.bias.data.copy_(_slice_col(full_fc1_b.unsqueeze(1), tp_rank, tp).squeeze(1))
-
-        full_fc2_w = full_state[prefix + "mlp.c_proj.weight"]
-        full_fc2_b = full_state[prefix + "mlp.c_proj.bias"]
-        blk.mlp.c_proj.weight.data.copy_(_slice_row(full_fc2_w, tp_rank, tp))
-        blk.mlp.c_proj.bias.data.copy_(full_fc2_b)
+        # MoE vs dense MLP
+        if _is_moe_block(blk):
+            _load_moe_weights(blk, full_state, prefix, ep_rank)
+        else:
+            _load_dense_mlp_weights(blk, full_state, prefix, tp_rank, tp)
 
 
 def main() -> None:
@@ -275,7 +303,7 @@ def main() -> None:
     if topo.pp > 1:
         stage = StageModule(cfg, topo, topo.pp_rank, topo.pp).to(device)
         engine = GPipeEngine(stage, topo)
-        load_stage_from_full_state(stage, base_state, topo.tp_rank, topo.tp)
+        load_stage_from_full_state(stage, base_state, topo.tp_rank, topo.tp, topo.ep_rank)
         stage.train()
         loss, _ = engine.forward_backward(
             loader=_LoaderAdapter(x, y),
@@ -290,7 +318,7 @@ def main() -> None:
         local_module = stage
     else:
         model = GPT(cfg, topo=topo).to(device)
-        load_gpt_from_full_state(model, base_state, topo.tp_rank, topo.tp)
+        load_gpt_from_full_state(model, base_state, topo.tp_rank, topo.tp, topo.ep_rank)
         model.train()
         _, loss, aux = model(x, y)
         (loss + aux).backward()
@@ -313,6 +341,7 @@ def main() -> None:
         "tp_rank": topo.tp_rank,
         "pp_rank": topo.pp_rank,
         "dp_rank": topo.dp_rank,
+        "ep_rank": topo.ep_rank,
         "grads": local_grads,
     }
     gathered: List[Any] = [None for _ in range(topo.world_size)] if topo.rank == 0 else None
@@ -321,10 +350,11 @@ def main() -> None:
     if topo.rank == 0:
         # reconstruct sharded grads for c_attn (QKV interleaved) and c_proj (axis=1)
         # Note: For PP, layer 0 (tr.h.0.*) is only on pp_rank=0 (first stage)
+        # Filter by dp_rank=0, ep_rank=0, and target pp_rank to get only TP shards
         def recon_shards(name: str, axis: int, target_pp_rank: int = 0) -> torch.Tensor:
             shards = []
             for item in gathered:
-                if item["dp_rank"] != 0 or item["pp_rank"] != target_pp_rank:
+                if item["dp_rank"] != 0 or item["pp_rank"] != target_pp_rank or item.get("ep_rank", 0) != 0:
                     continue
                 g = item["grads"].get(name)
                 if g is None:
@@ -346,7 +376,7 @@ def main() -> None:
             """
             shards = []
             for item in gathered:
-                if item["dp_rank"] != 0 or item["pp_rank"] != target_pp_rank:
+                if item["dp_rank"] != 0 or item["pp_rank"] != target_pp_rank or item.get("ep_rank", 0) != 0:
                     continue
                 g = item["grads"].get(name)
                 if g is None:

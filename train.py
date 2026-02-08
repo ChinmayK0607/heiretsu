@@ -354,7 +354,7 @@ def main():
     use_amp = args.amp in ("fp16", "bf16") and device.type in ("cuda", "mps")
     amp_dtype = torch.float16 if args.amp == "fp16" else torch.bfloat16
     scaler = torch.amp.GradScaler('cuda',enabled=(args.amp == "fp16"))
-    is_main = (topo.dp_rank == 0 and topo.tp_rank == 0 and topo.pp_rank == (topo.pp - 1))
+    is_main = (topo.dp_rank == 0 and topo.ep_rank == 0 and topo.tp_rank == 0 and topo.pp_rank == (topo.pp - 1))
 
     def collect_expert_counts(module):
         """Gather per-expert token counts from all MoELayer instances."""

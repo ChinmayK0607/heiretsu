@@ -740,7 +740,46 @@ This applies to:
 |----------|---------------|------|
 | Logit collection after PP forward | `logits` tensor | `parallel_sanity.py` |
 | Loss reporting per training step | `loss_scalar` tensor | `boundary_push.py` |
+| `is_main` guard for wandb / printing | N/A (gating flag) | `train.py` |
 | Any future rank-0 aggregation | Whatever payload | — |
+
+### The `is_main` Variant: Duplicate wandb Runs
+
+The same bug pattern manifests differently in `train.py`—not as a deadlock,
+but as **duplicate wandb runs** that make loss charts look noisy.
+
+```python
+# WRONG — missing ep_rank filter
+is_main = (topo.dp_rank == 0 and topo.tp_rank == 0
+           and topo.pp_rank == (topo.pp - 1))
+```
+
+With `dp=2, ep=2, tp=2, pp=1`, both rank 0 (`ep_rank=0`) and rank 2
+(`ep_rank=1`) satisfy this condition. Both call `wandb.init()`, creating
+**two separate runs** logging to the same project with overlapping steps:
+
+```
+  wandb dashboard (step 50)
+  ─────────────────────────────────────
+  Run A (rank 0, ep=0): loss = 7.7472   ●
+  Run B (rank 2, ep=1): loss = 7.7453     ●  ← slightly different
+                                               due to EP all-to-all
+                                               float non-determinism
+```
+
+The result is a chart that looks "noisy" with two interleaved traces
+at slightly different y-values. The fix is identical:
+
+```python
+# CORRECT — single logging rank
+is_main = (topo.dp_rank == 0 and topo.ep_rank == 0  # ← added
+           and topo.tp_rank == 0
+           and topo.pp_rank == (topo.pp - 1))
+```
+
+> **Lesson:** The EP coordinate filter isn't just about send/recv deadlocks.
+> Any "do this once" guard (`is_main`, singleton init, file I/O) must
+> include `ep_rank == 0` or every EP replica will duplicate the action.
 
 ### Why This Doesn't Affect the Pipeline Itself
 

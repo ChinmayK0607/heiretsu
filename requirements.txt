@@ -1,0 +1,10 @@
+# Core runtime
+numpy
+torch
+einops
+huggingface_hub
+datasets
+wandb
+
+# Optional test runner
+pytest
